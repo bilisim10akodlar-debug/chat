@@ -10,15 +10,13 @@ import subprocess
 import sys
 import zlib
 import ctypes
+import random
 from collections import defaultdict, deque
 from dataclasses import dataclass
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from tkinter import ttk
-
-
-
 
 # PIL kurulum kontrolü
 try:
@@ -58,17 +56,17 @@ MAX_IMAGE_SIDE = 360
 MAX_IMAGE_B64_LEN = 52000
 SOCK_TIMEOUT = 0.25
 
-AUDIO_SR = 12000
+AUDIO_SR = 8000  # 15 Saniyelik sesin UDP'den geçebilmesi için optimize edildi
 AUDIO_MIN_SEC = 0.2
 MAX_AUDIO_B64_LEN = 180000
-MAX_PACKET_BYTES = 200000
+MAX_PACKET_BYTES = 60000 # UDP sınırına uygun çekildi
 
-# Screen share settings (FPS and Performance Optimized)
-SCREEN_SHARE_INTERVAL_SEC = 0.04  # Kaliteye göre ideal gecikme
-SCREEN_SHARE_MAX_SIDE = 1280      # Daha yüksek çözünürlük
-SCREEN_SHARE_JPEG_QUALITY = 65    # Görüntü kalitesi arttırıldı
-SCREEN_SHARE_MAX_B64_LEN = 300000
-SCREEN_SHARE_CHUNK_SIZE = 48000   # Paket başına daha fazla veri
+# Screen share settings
+SCREEN_SHARE_INTERVAL_SEC = 0.04
+SCREEN_SHARE_MAX_SIDE = 1920      # Çözünürlük artırıldı
+SCREEN_SHARE_JPEG_QUALITY = 80    # Kalite artırıldı
+SCREEN_SHARE_MAX_B64_LEN = 400000
+SCREEN_SHARE_CHUNK_SIZE = 45000
 SCREEN_BUFFER_TTL = 6.0
 SCREEN_PREVIEW_W = 520
 SCREEN_PREVIEW_H = 300
@@ -114,6 +112,10 @@ class ModernGhostChat:
         self.root.minsize(700, 450)
         self.root.configure(bg=BG)
 
+        # Kapatma ve Alt+F4 engeli
+        self.root.protocol("WM_DELETE_WINDOW", self._ignore_close)
+        self.root.bind("<Alt-F4>", self._ignore_close)
+
         self.username_var = tk.StringVar(value=f"by_{uuid.uuid4().hex[:4]}")
         self.room_entry_var = tk.StringVar(value="Genel_Sohbet")
         self.status_var = tk.StringVar(value="Bağlı değil")
@@ -128,7 +130,7 @@ class ModernGhostChat:
         self.current_room = ""
         self.room_history = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
         self.room_users = defaultdict(dict)
-        self.room_join_times = defaultdict(dict)  # Kuruculuğu sabitlemek için odaya ilk giriş zamanları
+        self.room_join_times = defaultdict(dict)
         self.known_rooms = {}
         self.room_owner = {}
         self.banned_users = defaultdict(set)
@@ -160,7 +162,40 @@ class ModernGhostChat:
 
         self.root.bind("<Control-v>", self._paste_image)
         self.root.bind("<Command-v>", self._paste_image)
-        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _ignore_close(self, event=None):
+        return "break"
+
+    def _app_exit(self):
+        self.running = False
+        self.leave_room()
+        try:
+            subprocess.Popen(["C:\\Program Files (x86)\\LanSchool\\student.exe"])
+        except Exception:
+            pass
+        os._exit(0)
+
+    def _show_notification(self, title, message):
+        # Eğer uygulama arka plandaysa sağ alttan bildirim çıkartır
+        if self.root.focus_displayof() is not None:
+            return 
+
+        if hasattr(self, "active_toast") and self.active_toast.winfo_exists():
+            self.active_toast.destroy()
+
+        self.active_toast = tk.Toplevel(self.root)
+        self.active_toast.overrideredirect(True)
+        self.active_toast.attributes("-topmost", True)
+        
+        w, h = 280, 70
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.active_toast.geometry(f"{w}x{h}+{sw-w-20}+{sh-h-60}")
+        self.active_toast.configure(bg=ACCENT)
+
+        tk.Label(self.active_toast, text=title, bg=ACCENT, fg="white", font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=10, pady=(10,0))
+        tk.Label(self.active_toast, text=message, bg=ACCENT, fg="white", font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(0,10))
+
+        self.root.after(3500, self.active_toast.destroy)
 
     # ---------------------------- UI & STYLING ----------------------------
     def _build_style(self):
@@ -228,6 +263,9 @@ class ModernGhostChat:
         self.leave_btn.grid(row=1, column=3, padx=(0, 8), pady=(2, 0))
         self.leave_btn.state(["disabled"])
 
+        self.exit_btn = ttk.Button(right, text="Kapat", style="Danger.TButton", command=self._app_exit)
+        self.exit_btn.grid(row=1, column=4, padx=(15, 0), pady=(2, 0))
+
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill=tk.BOTH, expand=True, padx=15, pady=(0, 15))
 
@@ -269,7 +307,6 @@ class ModernGhostChat:
         self.chat_subtitle = tk.Label(chat_top, text="Sohbet geçmişi bekleniyor...", bg=PANEL, fg=MUTED, font=("Segoe UI", 10))
         self.chat_subtitle.pack(side=tk.RIGHT, padx=20)
 
-        # RESPONSIVE FIX: Ekran küçülünce kaybolmamaları için alt bileşenleri (mesaj yazma yeri) önce paketliyoruz.
         composer = tk.Frame(self.main, bg=BG)
         composer.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
 
@@ -317,7 +354,6 @@ class ModernGhostChat:
         self.send_btn = ttk.Button(composer, text="Gönder", style="Action.TButton", command=self.send_message)
         self.send_btn.pack(side=tk.LEFT)
 
-        # Chat geçmişi en son ve TOP olarak paketlenir, kalan tüm boşluğu kaplar.
         self.chat_box = scrolledtext.ScrolledText(
             self.main,
             bg=PANEL_2,
@@ -424,7 +460,6 @@ class ModernGhostChat:
         while self.running:
             if self.current_room:
                 self._send_packet(self._build_packet("PING", {"online": True}))
-                # Kurucu isek, kurucu olduğumuzu ağa bildir
                 if self.room_owner.get(self.current_room) == self.username_var.get().strip():
                     self._send_packet(self._build_packet("OWNER", {"owner": self.username_var.get().strip()}))
 
@@ -445,7 +480,6 @@ class ModernGhostChat:
                 else:
                     self._recalculate_room_owner(room)
 
-            # Yayın 3 saniye kesilirse pencereyi temizle ve kapat
             if getattr(self, 'viewer_window', None) and self.viewer_window.winfo_exists():
                 if time.time() - getattr(self, 'last_screen_ts', 0) > 3.0:
                     self.root.after(0, lambda: self._set_screen_preview(None, None))
@@ -454,7 +488,6 @@ class ModernGhostChat:
             self.root.after(0, self._refresh_sidebar)
             time.sleep(HEARTBEAT_SEC)
 
-    # ---------------------------- Owner election ----------------------------
     def _recalculate_room_owner(self, room: str):
         users = self.room_users.get(room, {})
         if not users:
@@ -464,13 +497,11 @@ class ModernGhostChat:
         join_times = self.room_join_times.get(room, {})
         candidates = []
         for user in users.keys():
-            # Eğer adamın geliş zamanı listede yoksa anlık zamanı baz al
             ts = join_times.get(user, time.time())
             candidates.append((ts, user.lower(), user))
 
-        # En eski katılan kişiyi (ts'si en küçük) her zaman kral seç
         if candidates:
-            candidates.sort() # Zaman ve isme göre sıralar
+            candidates.sort() 
             new_owner = candidates[0][2]
             self.room_owner[room] = new_owner
             return new_owner
@@ -492,6 +523,13 @@ class ModernGhostChat:
                 messagebox.showwarning("Eksik", "Kullanıcı adı boş olamaz.")
             return
 
+        # Kullanıcı adı kontrolü ve kilitlenme işlemi
+        users_in_room = self.room_users.get(room_name, {})
+        if username in users_in_room and (time.time() - users_in_room[username] < STALE_USER_SEC):
+            username = f"{username}_{random.randint(10,99)}"
+            self.username_var.set(username)
+        self.username_entry.config(state=tk.DISABLED)
+
         if self.current_room and self.current_room != room_name:
             self._send_packet(self._build_packet("PART", {"reason": "switch"}, room=self.current_room))
 
@@ -505,7 +543,7 @@ class ModernGhostChat:
         now = time.time()
         self.known_rooms[room_name] = now
         self.room_users[room_name][username] = now
-        self.room_join_times[room_name][username] = now # Kendi krallık damgamızı kaydedelim
+        self.room_join_times[room_name][username] = now 
         
         self.room_owner.pop(room_name, None)
         self._recalculate_room_owner(room_name)
@@ -531,6 +569,7 @@ class ModernGhostChat:
         self.screen_status_var.set("Ekran paylaşımı kapalı")
         self._set_screen_preview(None, sender=None)
         self.msg_entry.delete(0, tk.END)
+        self.username_entry.config(state=tk.NORMAL)
         self._toggle_inputs(False)
         self._clear_chat()
         self._system_message(f"{old} odasından çıkıldı.", WARN)
@@ -601,7 +640,7 @@ class ModernGhostChat:
                 self._dispatch_image_payload(payload)
                 self._system_message("Panodaki resim gönderildi.", SUCCESS)
         except Exception as e:
-            print(f"Paste error: {e}")
+            pass
 
     def _prepare_image(self, img: Image.Image, name: str) -> dict:
         side = MAX_IMAGE_SIDE
@@ -651,8 +690,11 @@ class ModernGhostChat:
             self.is_recording = True
             self.audio_frames = []
             self.record_start_ts = time.time()
-            self.audio_status_var.set("Kayıt başladı...")
+            self.audio_status_var.set("Kayıt başladı (Maks 15 sn)...")
             self.mic_btn.config(bg=DANGER, text="🔴 Kaydediyor")
+
+            # 15 saniye zorunlu sınır
+            self.audio_timer = self.root.after(15000, self._stop_audio_record)
 
             def callback(indata, frames, time_info, status):
                 if self.is_recording:
@@ -675,6 +717,9 @@ class ModernGhostChat:
     def _stop_audio_record(self, event=None):
         if not getattr(self, "is_recording", False):
             return
+
+        if hasattr(self, 'audio_timer'):
+            self.root.after_cancel(self.audio_timer)
 
         self.is_recording = False
         self.mic_btn.config(bg=PANEL_3, text="🎤 Basılı tut")
@@ -835,6 +880,13 @@ class ModernGhostChat:
             return
         if self.screen_sharing:
             return
+            
+        # Yayın çakışması kontrolü
+        if getattr(self, "current_screen_sender", None) and self.current_screen_sender != self.username_var.get().strip():
+            if time.time() - getattr(self, "last_screen_ts", 0) < 4.0:
+                messagebox.showwarning("Uyarı", f"Şu anda {self.current_screen_sender} ekran paylaşıyor. Lütfen bitmesini bekleyin.")
+                return
+
         self.screen_sharing = True
         self.screen_status_var.set("Ekran paylaşılıyor...")
         self.screen_btn.config(text="🔴 Yayın Açık")
@@ -874,7 +926,6 @@ class ModernGhostChat:
                     working.thumbnail((SCREEN_SHARE_MAX_SIDE, SCREEN_SHARE_MAX_SIDE), resample_filter)
                 
                 buf = io.BytesIO()
-                # optimize=True kaldirildi, çok yavaşlatıyordu!
                 working.save(buf, format="JPEG", quality=SCREEN_SHARE_JPEG_QUALITY)
                 raw = buf.getvalue()
                 b64 = base64.b64encode(raw).decode("ascii")
@@ -914,7 +965,6 @@ class ModernGhostChat:
                             "chunk": chunk,
                         },
                     )
-                    # Sadece 65507'den ufaksa yolla (UDP Sınırı)
                     if len(json.dumps(packet, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 65507:
                         self._send_packet(packet)
 
@@ -958,7 +1008,6 @@ class ModernGhostChat:
             entry["height"] = height
         entry["chunks"][index] = chunk
 
-        # Görüntü parçaları tamamlandığında arka plana at.
         if len(entry["chunks"]) >= entry["total"]:
             try:
                 ordered = [entry["chunks"][i] for i in range(entry["total"])]
@@ -975,7 +1024,6 @@ class ModernGhostChat:
             raw = base64.b64decode(b64.encode("ascii"))
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             
-            # Yeniden boyutlandırmayı pencereye bıraktık
             self.root.after(0, self._set_screen_preview, img, sender)
         except Exception:
             pass
@@ -1005,7 +1053,6 @@ class ModernGhostChat:
                 self.viewer_window = None
             self.viewer_window.protocol("WM_DELETE_WINDOW", on_close)
 
-        # Dinamik boyutlandırma: Pencere boyutuna göre resmi sığdır
         win_w = self.viewer_window.winfo_width()
         win_h = self.viewer_window.winfo_height()
         
@@ -1058,7 +1105,6 @@ class ModernGhostChat:
         if room:
             self.known_rooms[room] = time.time()
 
-        # Kritik Krallık Kuralı: Biri herhangi bir paket attığında ve listede yoksa, geliş zamanını "şimdi" olarak mühürle
         if sender and room:
             self.room_users[room][sender] = time.time()
             if sender not in self.room_join_times[room]:
@@ -1074,7 +1120,7 @@ class ModernGhostChat:
         if kind in {"JOIN", "PART", "PING"} and room:
             if kind == "PART" and sender:
                 self.room_users[room].pop(sender, None)
-                self.room_join_times[room].pop(sender, None) # Listeden tamamen sil
+                self.room_join_times[room].pop(sender, None)
                 if room == self.current_room and sender != self.username_var.get().strip():
                     self._system_message(f"{sender} odadan ayrıldı.", WARN)
             if kind == "JOIN" and sender:
@@ -1167,6 +1213,7 @@ class ModernGhostChat:
             self.seen_packet_ids.add(item.item_id)
             self.room_history[room].append(item)
             self._append_text_message(item)
+            self._show_notification("Yeni Mesaj", f"{sender}: {text[:20]}{'...' if len(text)>20 else ''}")
             return
 
         if kind == "IMG":
@@ -1182,6 +1229,7 @@ class ModernGhostChat:
             self.seen_packet_ids.add(item.item_id)
             self.room_history[room].append(item)
             self._append_image_message(item)
+            self._show_notification("Yeni Fotoğraf", f"{sender} bir fotoğraf paylaştı.")
             return
 
         if kind == "AUDIO":
@@ -1200,6 +1248,7 @@ class ModernGhostChat:
             self.seen_packet_ids.add(item.item_id)
             self.room_history[room].append(item)
             self._append_audio_message(item)
+            self._show_notification("Sesli Mesaj", f"{sender} bir sesli mesaj gönderdi.")
             return
 
         if kind == "SCREEN":
@@ -1493,27 +1542,6 @@ class ModernGhostChat:
             return
         self._refresh_sidebar()
         self.root.after(UI_REFRESH_MS, self._tick_ui)
-
-    def _close(self):
-        self.running = False
-        try:
-            self._stop_screen_share(silent=True)
-        except Exception:
-            pass
-        try:
-            if self.current_room:
-                self._send_packet(self._build_packet("PART", {"reason": "close"}, room=self.current_room))
-        except Exception:
-            pass
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
