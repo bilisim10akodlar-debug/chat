@@ -52,61 +52,6 @@ sorular = [
         "dogru_cevap": "a",
         "sayi": "1"
     },
-    {
-        "soru": "2. Hangi adam daha guvenilir?",
-        "siklar": {"a": "Apo", "b": "Selo", "c": "Sefa", "d": "Hicbiri"},
-        "dogru_cevap": "c",
-        "sayi": "2"
-
-    },
-    {
-        "soru": "3. Kurdistan nerededir?",
-        "siklar": {"a": " ", "b": "Bilmiyorum", "c": "Iran Turkiye Suriye arasinda.", "d": "Bize her yer kurdistan"},
-        "dogru_cevap": "a",
-        "sayi": "3"
-    },
-    {
-        "soru": "4. Apoyu karsinda gorsen ne yaparsin?",
-        "siklar": {"a": "Ornek aldigim adam. Saygi duyarim", "b": "Elini operim", "c": "Kacarim", "d": "Hemen oracikta doverim"},
-        "dogru_cevap": "d",
-        "sayi": "4"
-    },
-    {
-        "soru": "5. Turkiye nasil bir yer?",
-        "siklar": {"a": "Guzelligin ve medeniyetin bir arada toplandigi yer.", "b": "Cennet", "c": "Yakinda yikilacak", "d": "Bilmiyorum"},
-        "dogru_cevap": "a",
-        "sayi": "5"
-    },
-    {
-        "soru": "6. Bu uygulama ......",
-        "siklar": {"a": "Bok gibidir", "b": "Kotudur", "c": "Zor sartlar altinda, kalite ve efsanevi yazilim bilgisi.", "d": "Iyi."},
-        "dogru_cevap": "c",
-        "sayi": "6"
-    },
-    {
-        "soru": "7. Emol nerededir",
-        "siklar": {"a": "Kurdistan", "b": "Turkiye", "c": "Tokat", "d": "Istanbul"},
-        "dogru_cevap": "b",
-        "sayi": "7"
-    },
-    {
-        "soru": "8. En guclu fiber internet nerededir",
-        "siklar": {"a": "Tokat Fiber", "b": "Giga Fiber Istanbul", "c": "Izmir", "d": "Kurdistan"},
-        "dogru_cevap": "a",
-        "sayi": "8"
-    },
-    {
-        "soru": "9. Uygulamayi kullanmak .....",
-        "siklar": {"a": "Istemiyorummmm", "b": "Istiyorum", "c": "Istiyorummmmmmmmm", "d": "Ne biliyim"},
-        "dogru_cevap": "c",
-        "sayi": "9"
-    },
-    {
-        "soru": "10. Bilgisayar",
-        "siklar": {"a": "Kotudur", "b": "Zordur", "c": "Kolaydir", "d": "Bilgisayardir"},
-        "dogru_cevap": "d",
-        "sayi": "10"
-    }
 ]
 
 # Küresel değişkenler
@@ -125,7 +70,6 @@ def testi_baslat():
     toplam_soru = len(sorular)
 
     for index, soru_verisi in enumerate(sorular, start=1):
-        # Kaçıncı soruda olduğunu gösteren başlık
         print(f"\n--- SORU {index} / {toplam_soru} ---")
         print(soru_verisi["soru"])
         
@@ -142,7 +86,6 @@ def testi_baslat():
             print("Doğru!")
             dogru_sayisi += 1
         else:
-            # İlk soruya yanlış cevap verilirse durumu güncelle
             if index == 1:
                 print("Bilgilendirme: İlk soruya verilen cevap sistem analizini etkileyecektir.")
                 turkmu_durumu = False
@@ -153,30 +96,21 @@ def testi_baslat():
     print("-" * 50)
     print(f"Test tamamlandı! Skorunuz: {dogru_skor} / {toplam_soru}")
     print("-" * 50)
-    
-    input("Devam etmek için Enter'a basın...")
     ana_sistemi_calistir()
 
 def analiz():
-    # Global değişkenleri okuyoruz
-    if not turkmu_durumu and dogru_skor >= 9:
+    if turkmu_durumu:
         print("Analiz sonucu: Geçti (Kriter 2)")
-        return True
-    elif turkmu_durumu and dogru_skor >= 5:
-        print("Analiz sonucu: Geçti (Kriter 1)")
         return True
     else:
         print("Analiz sonucu: Başarısız")
         return False
 
 def ana_sistemi_calistir():
-    # Teknik Hata Düzeltmesi: Metin ile Boolean/Sayı toplanamaz, f-string veya str() kullanılmalı
     print(f"\nSistem Başlatılıyor... Durum: {turkmu_durumu}, Skor: {dogru_skor}")
     
     if analiz():
         print("Sistem başarıyla açıldı.")
-        input("tmm")
-        # Uygulama ana kodları buraya
         import base64
         import io
         import json
@@ -1730,7 +1664,7 @@ def ana_sistemi_calistir():
 
     else:
         print("Erişim reddedildi.")
-        input("sg")
+        input("Tamam.")
 
 
 if __name__ == "__main__":
