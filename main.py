@@ -14,6 +14,7 @@ import zlib
 import ctypes
 import random
 import struct
+import datetime
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
@@ -23,11 +24,11 @@ from tkinter import ttk
 
 # PIL kurulum kontrolü
 try:
-    from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont, ImageFilter, ImageEnhance
     PIL_AVAILABLE = True
 except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pillow"])
-    from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageTk, ImageGrab, ImageDraw, ImageFont, ImageFilter, ImageEnhance
     PIL_AVAILABLE = True
 
 # Ses kütüphanesi kontrolü
@@ -46,14 +47,14 @@ except ImportError:
 
 # ===================== SABITLER =====================
 APP_TITLE              = "OPSI Pro"
-APP_VERSION            = "10.0"
+APP_VERSION            = "11.0"
 PORT                   = 45127
 BROADCAST_ADDR         = "255.255.255.255"
 UI_REFRESH_MS          = 100
 HEARTBEAT_SEC          = 3
 STALE_USER_SEC         = 14
 STALE_ROOM_SEC         = 24
-MAX_HISTORY            = 120
+MAX_HISTORY            = 200
 MAX_IMAGE_SIDE         = 480
 MAX_IMAGE_B64_LEN      = 60000
 SOCK_TIMEOUT           = 0.20
@@ -61,7 +62,7 @@ AUDIO_SR               = 8000
 AUDIO_MIN_SEC          = 0.2
 MAX_AUDIO_B64_LEN      = 180000
 MAX_PACKET_BYTES       = 60000
-SCREEN_SHARE_INTERVAL  = 0.0166   # ~30 fps
+SCREEN_SHARE_INTERVAL  = 0.0166
 SCREEN_SHARE_MAX_SIDE  = 1920
 SCREEN_SHARE_JPEG_Q    = 78
 SCREEN_SHARE_MAX_B64   = 400000
@@ -69,6 +70,8 @@ SCREEN_SHARE_CHUNK     = 45000
 SCREEN_BUFFER_TTL      = 6.0
 MAX_FILE_BYTES         = 400_000
 FILE_CHUNK_SIZE        = 40_000
+MAX_MSG_LEN            = 2000
+TOAST_DURATION_MS      = 4000
 
 CONFIG_DOSYASI = "opsi_config.json"
 
@@ -126,6 +129,7 @@ MENTION   = "#1a2940"
 GLASS     = "#ffffff08"
 GLASS_H   = "#ffffff12"
 SHADOW    = "#00000066"
+REPLY_BG  = "#161b22"
 
 AVATAR_PALETTE = [
     "#388bfd","#3fb950","#d29922","#f85149",
@@ -138,10 +142,36 @@ EMOJI_LIST = [
     "❤️","🔥","✨","💯","🎉","👀","🙏","😴","🤣","😱",
     "🥳","🤙","💪","🫡","💀","😅","🤦","🫶","👋","🤷",
     "🎮","💻","📱","🌙","⚡","🎯","🏆","💡","🚀","🔮",
+    "🌟","🎵","🎪","🦋","🌈","🍕","☕","🧠","🔑","💎",
+    "🌊","🎭","🦊","🐉","⚔️","🛡️","🎲","🧪","🌺","🦅",
 ]
 
-STATUS_ICONS = {"online": "●", "away": "◐", "dnd": "⊘", "offline": "○"}
+QUICK_REACTIONS = ["👍","👎","❤️","😂","😮","😢","🔥","🎉","💯","🤔"]
+
+STATUS_ICONS  = {"online": "●", "away": "◐", "dnd": "⊘", "offline": "○"}
 STATUS_COLORS = {"online": SUCCESS, "away": WARN, "dnd": DANGER, "offline": MUTED}
+STATUS_LABELS = {"online": "Çevrimiçi", "away": "Uzakta", "dnd": "Rahatsız Etme", "offline": "Görünmez"}
+
+FILE_ICONS = {
+    "pdf": "📄", "zip": "🗜️", "rar": "🗜️", "7z": "🗜️",
+    "py":  "🐍", "txt": "📝", "md":  "📝", "json": "📋",
+    "csv": "📊", "xlsx": "📊", "xls": "📊", "html": "🌐",
+    "xml": "🌐", "docx": "📘", "doc": "📘", "pptx": "📙",
+    "mp3": "🎵", "wav":  "🎵", "mp4": "🎬", "avi":  "🎬",
+    "png": "🖼️", "jpg":  "🖼️", "gif": "🖼️", "svg":  "🖼️",
+    "exe": "⚙️", "bat":  "⚙️", "sh":  "⚙️", "iso":  "💿",
+}
+
+THEMES = {
+    "Mavi (Varsayılan)": "#388bfd",
+    "Yeşil":             "#3fb950",
+    "Mor":               "#bc8cff",
+    "Kırmızı":           "#f85149",
+    "Altın":             "#d29922",
+    "Teal":              "#39c5cf",
+    "Pembe":             "#ff7b72",
+    "Turuncu":           "#f0883e",
+}
 
 # ===================== VERİ SINIFI =====================
 @dataclass
@@ -165,10 +195,13 @@ class ChatItem:
     ref_id     : str  = ""
     reactions  : dict = field(default_factory=dict)
     pinned     : bool = False
+    edited     : bool = False
+    reply_to   : str  = ""   # item_id of the message being replied to
+    reply_sender: str = ""   # sender of the replied message
+    reply_text : str  = ""   # text snippet of replied message
 
 # ===================== UTIL =====================
 def _make_rounded_rect_image(w, h, r, color, alpha=255):
-    """Rounded rectangle PIL image"""
     img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     r    = min(r, w // 2, h // 2)
@@ -177,31 +210,47 @@ def _make_rounded_rect_image(w, h, r, color, alpha=255):
     draw.rounded_rectangle([0, 0, w - 1, h - 1], radius=r, fill=rgb)
     return img
 
+def _fmt_filesize(n_bytes: int) -> str:
+    if n_bytes < 1024:
+        return f"{n_bytes} B"
+    elif n_bytes < 1024 * 1024:
+        return f"{n_bytes/1024:.1f} KB"
+    else:
+        return f"{n_bytes/1024/1024:.1f} MB"
+
+def _detect_lang(filename: str) -> str:
+    ext = os.path.splitext(filename)[1].lower().lstrip(".")
+    return {"py":"Python","js":"JavaScript","ts":"TypeScript","html":"HTML",
+            "css":"CSS","json":"JSON","xml":"XML","sql":"SQL","sh":"Shell",
+            "md":"Markdown","txt":"Metin","csv":"CSV"}.get(ext, ext.upper())
+
 # ===================== ANA UYGULAMA =====================
 class OPSIPro:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.root.geometry("1280x800")
-        self.root.minsize(960, 600)
+        self.root.geometry("1340x840")
+        self.root.minsize(1000, 620)
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self._app_exit)
         self.root.bind("<Alt-F4>", self._app_exit)
 
-        # DPI / rendering
         try:
             self.root.tk.call("tk", "scaling", 1.0)
         except Exception:
             pass
 
         # Config
-        self.cfg           = self._load_config()
-        saved_name         = self.cfg.get("username") or f"user_{uuid.uuid4().hex[:4]}"
-        self.sound_enabled = self.cfg.get("sound_enabled", True)
-        self.theme_accent  = self.cfg.get("theme_accent", ACCENT)
-        self.user_status   = self.cfg.get("user_status", "online")
-        self.compact_mode  = self.cfg.get("compact_mode", False)
+        self.cfg             = self._load_config()
+        saved_name           = self.cfg.get("username") or f"kullanici_{uuid.uuid4().hex[:4]}"
+        self.sound_enabled   = self.cfg.get("sound_enabled", True)
+        self.theme_accent    = self.cfg.get("theme_accent", ACCENT)
+        self.user_status     = self.cfg.get("user_status", "online")
+        self.compact_mode    = self.cfg.get("compact_mode", False)
         self.show_timestamps = self.cfg.get("show_timestamps", True)
+        self.notify_mentions_only = self.cfg.get("notify_mentions_only", False)
+        self.font_size       = self.cfg.get("font_size", 11)
+        self.message_preview = self.cfg.get("message_preview", True)
 
         self.username_var    = tk.StringVar(value=saved_name)
         self.avatar_b64_map  = {}
@@ -219,21 +268,22 @@ class OPSIPro:
         self.sock    = None
         self.running = True
 
-        self.current_room     = ""
-        self.room_history     = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-        self.room_users       = defaultdict(dict)
-        self.room_join_times  = defaultdict(dict)
-        self.known_rooms      = {}
-        self.room_owner       = {}
-        self.banned_users     = defaultdict(set)
-        self.seen_packet_ids  = set()
-        self.image_refs       = []
-        self.embed_refs       = []
-        self.selected_user    = None
-        self.pinned_messages  = defaultdict(list)
-        self.draft_messages   = {}
-        self.typing_users     = defaultdict(dict)
-        self._unread_counts   = defaultdict(int)
+        self.current_room      = ""
+        self.room_history      = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+        self.room_users        = defaultdict(dict)
+        self.room_join_times   = defaultdict(dict)
+        self.known_rooms       = {}
+        self.room_owner        = {}
+        self.banned_users      = defaultdict(set)
+        self.seen_packet_ids   = set()
+        self.image_refs        = []
+        self.embed_refs        = []
+        self.selected_user     = None
+        self.pinned_messages   = defaultdict(list)
+        self.draft_messages    = {}
+        self.typing_users      = defaultdict(dict)
+        self._unread_counts    = defaultdict(int)
+        self._mention_counts   = defaultdict(int)  # [İYİLEŞTİRME 1] Mention sayacı
 
         # Ses kaydı
         self.is_recording    = False
@@ -256,23 +306,50 @@ class OPSIPro:
         self.avatar_cache = {}
         self.avatar_refs  = []
 
-        # Chat grupla
+        # Gruplama
         self._last_chat_sender = ""
         self._last_chat_ts     = 0.0
 
-        # Dosya chunk tamponu
+        # Chunk tampon
         self.file_buffers = {}
 
-        # Mesaj -> satır eşleşmesi
+        # Mesaj satır haritası
         self._msg_line_map: dict[str, str] = {}
 
-        # Splash göster
+        # [İYİLEŞTİRME 2] Reply state
+        self._reply_item: ChatItem | None = None
+
+        # [İYİLEŞTİRME 3] Mesaj geçmişi (↑ ↓ navg.)
+        self._sent_history = []
+        self._sent_hist_idx = -1
+
+        # [İYİLEŞTİRME 4] Toast kuyruğu
+        self._toast_queue = []
+        self._active_toast = None
+
+        # [İYİLEŞTİRME 5] Bağlantı istatistikleri
+        self._stats = {"sent": 0, "recv": 0, "errors": 0, "start_time": time.time()}
+
+        # [İYİLEŞTİRME 6] Odaya göre başlıklar/açıklamalar
+        self.room_topics = {}
+
+        # [İYİLEŞTİRME 7] Kullanıcı notları
+        self.user_notes = self.cfg.get("user_notes", {})
+
+        # Context menü state
+        self._ctx_item_id = None
+
+        # [İYİLEŞTİRME 8] Animasyon state
+        self._sidebar_anim_jobs = []
+
         self._show_splash()
 
         self.root.bind("<Control-v>", self._paste_image)
         self.root.bind("<Command-v>", self._paste_image)
-        self.root.bind("<Control-f>", lambda e: self._focus_search())
+        self.root.bind("<Control-f>", lambda e: self._focus_chat_search())
+        self.root.bind("<Control-k>", lambda e: self._quick_room_switcher())
         self.root.bind("<Escape>",    self._on_escape)
+        self.root.bind("<Control-comma>", lambda e: self._show_settings())
 
     # ==================== SPLASH =====================
     def _show_splash(self):
@@ -280,48 +357,59 @@ class OPSIPro:
         splash.overrideredirect(True)
         splash.attributes("-topmost", True)
         sw, sh = splash.winfo_screenwidth(), splash.winfo_screenheight()
-        w, h   = 420, 260
+        w, h   = 460, 300
         splash.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
         splash.configure(bg=PANEL_3)
 
-        # Border
-        tk.Frame(splash, bg=ACCENT, height=3).pack(fill=tk.X)
+        tk.Frame(splash, bg=self.theme_accent, height=3).pack(fill=tk.X)
 
         cnt = tk.Frame(splash, bg=PANEL_3)
-        cnt.pack(fill=tk.BOTH, expand=True, padx=40, pady=30)
+        cnt.pack(fill=tk.BOTH, expand=True, padx=48, pady=36)
 
-        # Logo
         logo_f = tk.Frame(cnt, bg=PANEL_3)
-        logo_f.pack(pady=(0, 20))
-        tk.Label(logo_f, text="⚡", bg=PANEL_3, fg=ACCENT,
-                 font=("Segoe UI", 36)).pack(side=tk.LEFT)
+        logo_f.pack(pady=(0, 8))
+        tk.Label(logo_f, text="⚡", bg=PANEL_3, fg=self.theme_accent,
+                 font=("Segoe UI", 40)).pack(side=tk.LEFT)
         tk.Label(logo_f, text="OPSI", bg=PANEL_3, fg=TEXT,
-                 font=("Segoe UI", 32, "bold")).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Label(logo_f, text="Pro", bg=PANEL_3, fg=ACCENT,
-                 font=("Segoe UI", 16)).pack(side=tk.LEFT, padx=(4, 0), pady=(12, 0))
+                 font=("Segoe UI", 36, "bold")).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Label(logo_f, text="Pro", bg=PANEL_3, fg=self.theme_accent,
+                 font=("Segoe UI", 18)).pack(side=tk.LEFT, padx=(4, 0), pady=(14, 0))
 
-        tk.Label(cnt, text="Ağ bağlantısı kuruluyor...", bg=PANEL_3, fg=MUTED,
-                 font=("Segoe UI", 10)).pack()
+        self._splash_lbl = tk.Label(cnt, text="Başlatılıyor...", bg=PANEL_3, fg=MUTED,
+                                    font=("Segoe UI", 10))
+        self._splash_lbl.pack(pady=(12, 0))
 
-        # Progress bar
-        prog_frame = tk.Frame(cnt, bg=BORDER, height=3)
-        prog_frame.pack(fill=tk.X, pady=(20, 0))
-        prog_fill = tk.Frame(prog_frame, bg=ACCENT, height=3)
-        prog_fill.place(x=0, y=0, width=0, height=3)
+        prog_frame = tk.Frame(cnt, bg=BORDER, height=4)
+        prog_frame.pack(fill=tk.X, pady=(16, 0))
+        prog_fill = tk.Frame(prog_frame, bg=self.theme_accent, height=4)
+        prog_fill.place(x=0, y=0, width=0, height=4)
 
-        ver_lbl = tk.Label(cnt, text=f"v{APP_VERSION}", bg=PANEL_3, fg=MUTED_2,
-                           font=("Segoe UI", 8))
-        ver_lbl.pack(anchor="se", side=tk.BOTTOM)
+        tk.Label(cnt, text=f"v{APP_VERSION}  •  LAN Anlık Mesajlaşma",
+                 bg=PANEL_3, fg=MUTED_2, font=("Segoe UI", 8)).pack(
+                     anchor="se", side=tk.BOTTOM, pady=(8, 0))
+
+        steps = [
+            (15,  "Ağ soketi açılıyor…"),
+            (40,  "Arayüz hazırlanıyor…"),
+            (65,  "Yapılandırma yükleniyor…"),
+            (85,  "Bağlantı kuruluyor…"),
+            (100, "Hazır!"),
+        ]
+        step_idx = [0]
 
         def animate_progress(val=0):
             if not splash.winfo_exists():
                 return
-            w_total = prog_frame.winfo_width() or 340
-            prog_fill.place(x=0, y=0, width=int(w_total * val / 100), height=3)
+            w_total = prog_frame.winfo_width() or 364
+            prog_fill.place(x=0, y=0, width=int(w_total * val / 100), height=4)
+            if step_idx[0] < len(steps) and val >= steps[step_idx[0]][0]:
+                if splash.winfo_exists():
+                    self._splash_lbl.config(text=steps[step_idx[0]][1])
+                step_idx[0] += 1
             if val < 100:
-                splash.after(12, lambda: animate_progress(val + 2))
+                splash.after(10, lambda: animate_progress(min(100, val + 2)))
             else:
-                splash.after(200, finish)
+                splash.after(300, finish)
 
         def finish():
             if splash.winfo_exists():
@@ -329,9 +417,9 @@ class OPSIPro:
             self._build_ui()
             self._start_network()
             self._tick_ui()
-            self._system_message(f"⚡ OPSI Pro v{APP_VERSION}'e hoş geldiniz!", ACCENT)
+            self._system_message(f"⚡ OPSI Pro v{APP_VERSION}'e hoş geldiniz! · /help ile komutları görün", ACCENT)
 
-        splash.after(100, lambda: animate_progress(0))
+        splash.after(80, lambda: animate_progress(0))
 
     # ==================== CONFIG ====================
     def _load_config(self):
@@ -357,23 +445,30 @@ class OPSIPro:
     def _save_config(self):
         me = self.username_var.get().strip()
         data = {
-            "username":        me,
-            "avatar_b64":      self.avatar_b64_map.get(me, ""),
-            "sound_enabled":   self.sound_enabled,
-            "theme_accent":    self.theme_accent,
-            "user_status":     self.user_status,
-            "compact_mode":    self.compact_mode,
-            "show_timestamps": self.show_timestamps,
+            "username":           me,
+            "avatar_b64":         self.avatar_b64_map.get(me, ""),
+            "sound_enabled":      self.sound_enabled,
+            "theme_accent":       self.theme_accent,
+            "user_status":        self.user_status,
+            "compact_mode":       self.compact_mode,
+            "show_timestamps":    self.show_timestamps,
+            "notify_mentions_only": self.notify_mentions_only,
+            "font_size":          self.font_size,
+            "message_preview":    self.message_preview,
+            "user_notes":         self.user_notes,
         }
         try:
             tmp = CONFIG_DOSYASI + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False)
+                json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, CONFIG_DOSYASI)
         except Exception:
             pass
 
     def _app_exit(self, event=None):
+        if self.current_room:
+            if not messagebox.askyesno("Çıkış", "OPSI Pro'dan çıkmak istediğinizden emin misiniz?"):
+                return
         self.running = False
         self._save_config()
         self.leave_room()
@@ -398,6 +493,23 @@ class OPSIPro:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
 
+    def _play_mention_sound(self):
+        """[İYİLEŞTİRME 9] Mention için farklı ses"""
+        if not self.sound_enabled or not AUDIO_AVAILABLE:
+            return
+        def _worker():
+            try:
+                sr = 22050
+                for freq, dur in [(660, 0.06), (880, 0.08), (1100, 0.10)]:
+                    t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+                    wave = (np.sin(2 * np.pi * freq * t) * 0.22 *
+                            np.exp(-t * 15)).astype(np.float32)
+                    sd.play(wave, samplerate=sr)
+                    sd.wait()
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _play_join_sound(self):
         if not self.sound_enabled or not AUDIO_AVAILABLE:
             return
@@ -414,35 +526,103 @@ class OPSIPro:
                 pass
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _show_notification(self, title, message, color=None):
+    def _play_error_sound(self):
+        if not self.sound_enabled or not AUDIO_AVAILABLE:
+            return
+        def _worker():
+            try:
+                sr = 22050
+                t  = np.linspace(0, 0.12, int(sr * 0.12), endpoint=False)
+                wave = (np.sin(2 * np.pi * 220 * t) * 0.2 *
+                        np.exp(-t * 10)).astype(np.float32)
+                sd.play(wave, samplerate=sr)
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # [İYİLEŞTİRME 10] Toast bildirim sistemi - animasyonlu
+    def _show_notification(self, title, message, color=None, is_mention=False):
         if self.root.focus_displayof() is not None:
             return
-        self._play_pop()
-        if hasattr(self, "active_toast") and self.active_toast.winfo_exists():
-            self.active_toast.destroy()
+        if self.notify_mentions_only and not is_mention:
+            return
+        if is_mention:
+            self._play_mention_sound()
+        else:
+            self._play_pop()
+        self._queue_toast(title, message, color or self.theme_accent, is_mention)
+
+    def _queue_toast(self, title, msg, color, urgent=False):
+        self._toast_queue.append((title, msg, color, urgent))
+        if self._active_toast is None or not self._active_toast.winfo_exists():
+            self._show_next_toast()
+
+    def _show_next_toast(self):
+        if not self._toast_queue:
+            self._active_toast = None
+            return
+        title, msg, color, urgent = self._toast_queue.pop(0)
         toast = tk.Toplevel(self.root)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
-        w, h = 340, 80
+        toast.attributes("-alpha", 0.0)
+        w, h = 360, 90
         sw   = self.root.winfo_screenwidth()
         sh   = self.root.winfo_screenheight()
-        toast.geometry(f"{w}x{h}+{sw-w-20}+{sh-h-80}")
+        x    = sw - w - 18
+        y    = sh - h - 90
+        toast.geometry(f"{w}x{h}+{x}+{y}")
         toast.configure(bg=PANEL_2)
-        self.active_toast = toast
+        self._active_toast = toast
 
-        accent_col = color or ACCENT
-        tk.Frame(toast, bg=accent_col, width=3).pack(side=tk.LEFT, fill=tk.Y)
+        # Accent bar + shadow frame
+        tk.Frame(toast, bg=color, width=4).pack(side=tk.LEFT, fill=tk.Y)
         c = tk.Frame(toast, bg=PANEL_2)
-        c.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=14, pady=10)
-        tk.Label(c, text=title,   bg=PANEL_2, fg=TEXT,  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        tk.Label(c, text=message, bg=PANEL_2, fg=MUTED, font=("Segoe UI",  9)).pack(anchor="w")
+        c.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=14, pady=12)
 
-        # Kapat butonu
+        title_f = tk.Frame(c, bg=PANEL_2)
+        title_f.pack(fill=tk.X)
+        if urgent:
+            tk.Label(title_f, text="🔔", bg=PANEL_2, fg=color,
+                     font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0,4))
+        tk.Label(title_f, text=title, bg=PANEL_2, fg=TEXT,
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, anchor="w")
+
+        tk.Label(c, text=msg[:52] + ("…" if len(msg) > 52 else ""),
+                 bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9),
+                 anchor="w", justify=tk.LEFT).pack(anchor="w")
+
         close_lbl = tk.Label(toast, text="×", bg=PANEL_2, fg=MUTED,
-                             font=("Segoe UI", 14), cursor="hand2")
-        close_lbl.pack(side=tk.RIGHT, padx=8)
-        close_lbl.bind("<Button-1>", lambda e: toast.destroy() if toast.winfo_exists() else None)
-        self.root.after(4000, lambda: toast.destroy() if toast.winfo_exists() else None)
+                             font=("Segoe UI", 15), cursor="hand2", padx=6)
+        close_lbl.pack(side=tk.RIGHT, padx=4)
+        close_lbl.bind("<Button-1>", lambda e: self._dismiss_toast(toast))
+        toast.bind("<Button-1>", lambda e: self._dismiss_toast(toast))
+
+        # Fade in
+        def fade_in(a=0.0):
+            if not toast.winfo_exists(): return
+            a = min(a + 0.08, 0.96)
+            toast.attributes("-alpha", a)
+            if a < 0.96:
+                toast.after(16, lambda: fade_in(a))
+        fade_in()
+
+        toast.after(TOAST_DURATION_MS, lambda: self._dismiss_toast(toast))
+
+    def _dismiss_toast(self, toast):
+        def fade_out(a=0.96):
+            if not toast.winfo_exists():
+                self._show_next_toast()
+                return
+            a = max(a - 0.12, 0.0)
+            toast.attributes("-alpha", a)
+            if a > 0.0:
+                toast.after(16, lambda: fade_out(a))
+            else:
+                if toast.winfo_exists():
+                    toast.destroy()
+                self._show_next_toast()
+        fade_out()
 
     # ==================== AVATAR ====================
     def _avatar_color(self, username):
@@ -462,7 +642,17 @@ class OPSIPro:
         r, g, b = self._avatar_color(username)
         img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([0, 0, size-1, size-1], fill=(r, g, b, 255))
+        # Gradient effect
+        for i in range(size):
+            ratio = i / size
+            rr = int(r * (1 - ratio * 0.25))
+            gg = int(g * (1 - ratio * 0.25))
+            bb = int(b * (1 - ratio * 0.25))
+            draw.line([(0, i), (size, i)], fill=(rr, gg, bb, 255))
+        mask2 = Image.new("L", (size, size), 0)
+        ImageDraw.Draw(mask2).ellipse([0, 0, size-1, size-1], fill=255)
+        img.putalpha(mask2)
+
         initial   = (username[0].upper() if username else "?")
         font_size = max(10, size // 2)
         font      = None
@@ -483,7 +673,7 @@ class OPSIPro:
             y = (size - th)//2 - bbox[1]
         except Exception:
             x, y = size//4, size//4
-        draw.text((x, y), initial, fill=(255, 255, 255, 230), font=font)
+        draw.text((x, y), initial, fill=(255, 255, 255, 240), font=font)
         return ImageTk.PhotoImage(img)
 
     def _get_avatar_image(self, username, size=40):
@@ -524,6 +714,7 @@ class OPSIPro:
             self._save_config()
             if self.current_room and len(b64) <= 28000:
                 self._send_packet(self._build_packet("AVATAR", {"b64": b64}))
+            self._system_message("✅ Profil fotoğrafı güncellendi.", SUCCESS)
         except Exception as exc:
             messagebox.showerror("Hata", f"Fotoğraf yüklenemedi:\n{exc}")
 
@@ -543,13 +734,13 @@ class OPSIPro:
         container.pack(fill=tk.BOTH, expand=True)
 
         # Sol sidebar (kanallar)
-        self.sidebar = tk.Frame(container, bg=PANEL_3, width=240)
+        self.sidebar = tk.Frame(container, bg=PANEL_3, width=250)
         self.sidebar.pack(side=tk.LEFT, fill=tk.Y)
         self.sidebar.pack_propagate(False)
         tk.Frame(container, bg=BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
 
         # Sağ sidebar (üyeler)
-        self.members_panel = tk.Frame(container, bg=PANEL, width=224)
+        self.members_panel = tk.Frame(container, bg=PANEL, width=230)
         self.members_panel.pack(side=tk.RIGHT, fill=tk.Y)
         tk.Frame(container, bg=BORDER, width=1).pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -565,23 +756,31 @@ class OPSIPro:
     def _build_sidebar(self):
         sb = self.sidebar
 
-        # Sunucu header
-        srv_hdr = tk.Frame(sb, bg=PANEL_3, height=54)
+        # Sunucu header - gradient etkili
+        srv_hdr = tk.Frame(sb, bg=PANEL_3, height=58)
         srv_hdr.pack(fill=tk.X)
         srv_hdr.pack_propagate(False)
         hdr_inner = tk.Frame(srv_hdr, bg=PANEL_3)
-        hdr_inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        tk.Label(hdr_inner, text="⚡", bg=PANEL_3, fg=ACCENT,
-                 font=("Segoe UI", 16, "bold")).pack(side=tk.LEFT)
+        hdr_inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=14)
+
+        tk.Label(hdr_inner, text="⚡", bg=PANEL_3, fg=self.theme_accent,
+                 font=("Segoe UI", 18, "bold")).pack(side=tk.LEFT)
         tk.Label(hdr_inner, text=" OPSI Pro", bg=PANEL_3, fg=TEXT,
-                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT)
+                 font=("Segoe UI", 15, "bold")).pack(side=tk.LEFT)
 
-        tk.Frame(sb, bg=BORDER, height=1).pack(fill=tk.X)
+        # [İYİLEŞTİRME 11] İstatistik butonu
+        stats_lbl = tk.Label(hdr_inner, text="📊", bg=PANEL_3, fg=MUTED,
+                             font=("Segoe UI", 12), cursor="hand2")
+        stats_lbl.pack(side=tk.RIGHT)
+        self._hover(stats_lbl, MUTED, TEXT)
+        stats_lbl.bind("<Button-1>", lambda e: self._show_stats_window())
 
-        # Arama alanı (sidebar)
+        tk.Frame(sb, bg=self.theme_accent, height=2).pack(fill=tk.X)  # Accent line
+
+        # Arama alanı
         search_wrap = tk.Frame(sb, bg=PANEL_3, pady=8)
         search_wrap.pack(fill=tk.X, padx=8)
-        search_f = tk.Frame(search_wrap, bg=INPUT, pady=0)
+        search_f = tk.Frame(search_wrap, bg=INPUT)
         search_f.pack(fill=tk.X)
         tk.Label(search_f, text=" 🔍", bg=INPUT, fg=MUTED,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT)
@@ -591,11 +790,10 @@ class OPSIPro:
             bd=0, font=("Segoe UI", 9), relief=tk.FLAT
         )
         self.sidebar_search.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=7, padx=(2, 4))
-        self.sidebar_search.insert(0, "Ara...")
+        self.sidebar_search.insert(0, "Kanal ara…")
         self.sidebar_search.config(fg=MUTED)
         self.sidebar_search.bind("<FocusIn>",  self._search_focus_in)
         self.sidebar_search.bind("<FocusOut>", self._search_focus_out)
-        self.sidebar_search.bind("<Return>",   lambda e: self._do_room_search())
         self.search_var.trace_add("write", lambda *a: self._do_room_search())
 
         # Kanallar başlık
@@ -609,7 +807,7 @@ class OPSIPro:
         self._hover(add_lbl, MUTED, TEXT)
         add_lbl.bind("<Button-1>", lambda e: self.room_entry.focus_set())
 
-        # Oda listesi (canvas tabanlı, daha iyi görünüm)
+        # Oda listesi
         rooms_frame = tk.Frame(sb, bg=PANEL_3)
         rooms_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -621,7 +819,20 @@ class OPSIPro:
         )
         self.rooms_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
         self.rooms_list.bind("<ButtonRelease-1>", self._on_room_click)
-        self.rooms_list.bind("<Enter>", lambda e: self.rooms_list.config(cursor="hand2"))
+        self.rooms_list.bind("<Button-3>", self._show_room_ctx_menu)  # [İYİLEŞTİRME 12]
+
+        # [İYİLEŞTİRME 12] Oda sağ-tık menüsü
+        self._room_ctx_menu = tk.Menu(
+            self.root, tearoff=0, bg=PANEL_2, fg=TEXT,
+            activebackground=ACCENT_S, activeforeground=TEXT,
+            bd=0, relief=tk.FLAT, font=("Segoe UI", 10)
+        )
+        self._room_ctx_menu.add_command(label="  🚀  Hızlı katıl", command=self._room_ctx_join)
+        self._room_ctx_menu.add_command(label="  📋  Adı kopyala", command=self._room_ctx_copy)
+        self._room_ctx_menu.add_separator()
+        self._room_ctx_menu.add_command(label="  🔕  Bildirimleri kapat",
+                                        command=lambda: self._mute_room())
+        self._room_ctx_selected = ""
 
         tk.Frame(sb, bg=BORDER, height=1).pack(fill=tk.X)
 
@@ -645,7 +856,7 @@ class OPSIPro:
         self.join_btn = tk.Button(
             btn_row, text="Katıl", bg=ACCENT_S, fg="white",
             bd=0, font=("Segoe UI", 10, "bold"), padx=0, pady=8,
-            cursor="hand2", activebackground=ACCENT, activeforeground="white",
+            cursor="hand2", activebackground=self.theme_accent, activeforeground="white",
             command=self._join_from_entry
         )
         self.join_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
@@ -659,37 +870,56 @@ class OPSIPro:
         self.leave_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         tk.Frame(sb, bg=BORDER, height=1).pack(fill=tk.X)
-        self.user_panel = tk.Frame(sb, bg=USER_BG, height=60)
+        self.user_panel = tk.Frame(sb, bg=USER_BG, height=64)
         self.user_panel.pack(fill=tk.X, side=tk.BOTTOM)
         self.user_panel.pack_propagate(False)
         self._build_user_panel()
 
+    def _show_room_ctx_menu(self, event):
+        idx = self.rooms_list.nearest(event.y)
+        if idx < 0 or idx >= self.rooms_list.size():
+            return
+        raw  = self.rooms_list.get(idx).strip()
+        room = re.sub(r'\s*\(\d+\)\s*$', '', raw.lstrip("#").strip())
+        self._room_ctx_selected = room
+        self._room_ctx_menu.tk_popup(event.x_root, event.y_root)
+
+    def _room_ctx_join(self):
+        if self._room_ctx_selected:
+            self.join_room(self._room_ctx_selected)
+
+    def _room_ctx_copy(self):
+        if self._room_ctx_selected:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self._room_ctx_selected)
+
+    def _mute_room(self):
+        self._system_message("Bu özellik yakında eklenecek.", MUTED)
+
     def _search_focus_in(self, event):
-        if self.sidebar_search.get() == "Ara...":
+        if self.sidebar_search.get() == "Kanal ara…":
             self.sidebar_search.delete(0, tk.END)
             self.sidebar_search.config(fg=TEXT)
 
     def _search_focus_out(self, event):
         if not self.sidebar_search.get():
-            self.sidebar_search.insert(0, "Ara...")
+            self.sidebar_search.insert(0, "Kanal ara…")
             self.sidebar_search.config(fg=MUTED)
 
     def _do_room_search(self):
         q = self.search_var.get().strip().lower()
-        if q == "ara...":
+        if q == "kanal ara…":
             q = ""
-        # filter rooms list
         self._refresh_sidebar(filter_q=q)
 
     def _build_user_panel(self):
         p  = self.user_panel
         me = self.username_var.get().strip()
-        av = self._get_avatar_image(me, 34)
+        av = self._get_avatar_image(me, 36)
         self.avatar_refs.append(av)
 
-        # Status indicator
         av_wrap = tk.Frame(p, bg=USER_BG)
-        av_wrap.pack(side=tk.LEFT, padx=(10, 6), pady=10)
+        av_wrap.pack(side=tk.LEFT, padx=(10, 6), pady=12)
         self.user_avatar_lbl = tk.Label(av_wrap, image=av, bg=USER_BG, cursor="hand2")
         self.user_avatar_lbl.image = av
         self.user_avatar_lbl.pack()
@@ -702,7 +932,7 @@ class OPSIPro:
         self.user_status_dot = status_dot
 
         name_f = tk.Frame(p, bg=USER_BG)
-        name_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=10)
+        name_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=12)
         self.user_name_lbl = tk.Label(
             name_f, text=me, bg=USER_BG, fg=TEXT,
             font=("Segoe UI", 10, "bold"), anchor="w", cursor="hand2"
@@ -710,42 +940,78 @@ class OPSIPro:
         self.user_name_lbl.pack(anchor="w")
         self.user_name_lbl.bind("<Button-1>", lambda e: self._show_settings())
 
+        # [İYİLEŞTİRME 13] Durum yazısı tıklanabilir
         self.user_status_lbl = tk.Label(
-            name_f, textvariable=self.status_var,
-            bg=USER_BG, fg=MUTED, font=("Segoe UI", 8), anchor="w"
+            name_f, text=STATUS_LABELS.get(self.user_status, "Çevrimiçi"),
+            bg=USER_BG, fg=STATUS_COLORS.get(self.user_status, SUCCESS),
+            font=("Segoe UI", 8), anchor="w", cursor="hand2"
         )
         self.user_status_lbl.pack(anchor="w")
+        self.user_status_lbl.bind("<Button-1>", lambda e: self._quick_status_menu())
 
         btn_f = tk.Frame(p, bg=USER_BG)
-        btn_f.pack(side=tk.RIGHT, padx=4)
+        btn_f.pack(side=tk.RIGHT, padx=6)
         for sym, tip, cmd in [
-            ("🎙", "Mikrofon", None),
-            ("🔇", "Ses", None),
+            ("🔇" if not self.sound_enabled else "🔔", "Ses",     self._toggle_sound),
             ("⚙️", "Ayarlar", self._show_settings),
         ]:
             lbl = tk.Label(btn_f, text=sym, bg=USER_BG, fg=MUTED,
-                           font=("Segoe UI", 12), cursor="hand2")
+                           font=("Segoe UI", 13), cursor="hand2")
             lbl.pack(side=tk.LEFT, padx=2)
             self._hover(lbl, MUTED, TEXT)
-            if cmd:
-                lbl.bind("<Button-1>", lambda e, c=cmd: c())
+            lbl.bind("<Button-1>", lambda e, c=cmd: c())
+            if tip == "Ses":
+                self.sound_panel_lbl = lbl
+
+    # [İYİLEŞTİRME 13] Hızlı durum menüsü
+    def _quick_status_menu(self):
+        menu = tk.Menu(self.root, tearoff=0, bg=PANEL_2, fg=TEXT,
+                       activebackground=ACCENT_S, activeforeground=TEXT,
+                       bd=0, relief=tk.FLAT, font=("Segoe UI", 10))
+        for status, label, col in [
+            ("online",  "🟢  Çevrimiçi",       SUCCESS),
+            ("away",    "🟡  Uzakta",           WARN),
+            ("dnd",     "🔴  Rahatsız Etme",    DANGER),
+            ("offline", "⚫  Görünmez",         MUTED),
+        ]:
+            menu.add_command(
+                label=f"  {label}",
+                command=lambda s=status, c=col: self._set_status(s, c)
+            )
+        try:
+            x = self.user_status_lbl.winfo_rootx()
+            y = self.user_status_lbl.winfo_rooty() - 100
+            menu.tk_popup(x, y)
+        except Exception:
+            pass
+
+    def _set_status(self, status, color):
+        self.user_status = status
+        if hasattr(self, "user_status_dot"):
+            self.user_status_dot.config(fg=STATUS_COLORS.get(status, SUCCESS))
+        if hasattr(self, "user_status_lbl"):
+            self.user_status_lbl.config(
+                text=STATUS_LABELS.get(status, status),
+                fg=STATUS_COLORS.get(status, SUCCESS)
+            )
+        self._save_config()
 
     # ---------- ÜYELER PANELİ ----------
     def _build_members_panel(self):
         mp = self.members_panel
 
-        hdr = tk.Frame(mp, bg=PANEL, height=54)
+        hdr = tk.Frame(mp, bg=PANEL, height=58)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
         hdr_inner = tk.Frame(hdr, bg=PANEL)
-        hdr_inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=14)
+        hdr_inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=16)
         tk.Label(hdr_inner, text="ÜYELER", bg=PANEL, fg=MUTED_2,
                  font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
         self.member_count_lbl = tk.Label(hdr_inner, text="", bg=PANEL, fg=MUTED,
                                          font=("Segoe UI", 9))
         self.member_count_lbl.pack(side=tk.LEFT, padx=(4, 0))
 
-        tk.Frame(mp, bg=BORDER, height=1).pack(fill=tk.X)
+        tk.Frame(mp, bg=self.theme_accent, height=2).pack(fill=tk.X)
 
         # Üye arama
         msearch_f = tk.Frame(mp, bg=PANEL, pady=6)
@@ -777,48 +1043,52 @@ class OPSIPro:
             activebackground=ACCENT_S, activeforeground=TEXT,
             bd=0, relief=tk.FLAT, font=("Segoe UI", 10)
         )
-        self.user_menu.add_command(label="  👁  Bilgileri gör",      command=self._show_selected_user_info)
-        self.user_menu.add_command(label="  🧹  Mesajlarını sil",     command=self._purge_selected_user_messages)
-        self.user_menu.add_command(label="  🔨  Banla",               command=self._ban_selected_user_cmd)
+        self.user_menu.add_command(label="  👁  Profili gör",       command=self._show_selected_user_info)
+        self.user_menu.add_command(label="  🧹  Mesajlarını sil",    command=self._purge_selected_user_messages)
+        self.user_menu.add_command(label="  🔨  Banla",              command=self._ban_selected_user_cmd)
         self.user_menu.add_separator()
-        self.user_menu.add_command(label="  📋  Adı kopyala",         command=self._copy_selected_user_name)
-        self.user_menu.add_command(label="  💬  Bahset",              command=self._mention_user)
+        self.user_menu.add_command(label="  📋  Adı kopyala",        command=self._copy_selected_user_name)
+        self.user_menu.add_command(label="  💬  Bahset",             command=self._mention_user)
+        self.user_menu.add_command(label="  📝  Not ekle",           command=self._add_user_note)  # [İYİLEŞTİRME 14]
 
     # ---------- ANA ALAN ----------
     def _build_main_area(self):
         main = self.main
 
         # Üst başlık
-        ch_hdr = tk.Frame(main, bg=BG, height=54)
+        ch_hdr = tk.Frame(main, bg=BG, height=58)
         ch_hdr.pack(fill=tk.X)
         ch_hdr.pack_propagate(False)
-        tk.Frame(main, bg=BORDER, height=1).pack(fill=tk.X)
 
         hdr_left = tk.Frame(ch_hdr, bg=BG)
-        hdr_left.pack(side=tk.LEFT, padx=16, pady=10)
+        hdr_left.pack(side=tk.LEFT, padx=16, pady=12)
         tk.Label(hdr_left, text="#", bg=BG, fg=MUTED_2,
-                 font=("Segoe UI", 18, "bold")).pack(side=tk.LEFT)
+                 font=("Segoe UI", 20, "bold")).pack(side=tk.LEFT)
         self.chat_title = tk.Label(hdr_left, text="kanal seçilmedi", bg=BG, fg=TEXT,
-                                   font=("Segoe UI", 14, "bold"))
+                                   font=("Segoe UI", 15, "bold"))
         self.chat_title.pack(side=tk.LEFT, padx=(4, 0))
-        sep = tk.Frame(hdr_left, bg=BORDER_2, width=1, height=20)
-        sep.pack(side=tk.LEFT, padx=14)
+        sep = tk.Frame(hdr_left, bg=BORDER_2, width=1, height=22)
+        sep.pack(side=tk.LEFT, padx=16)
+
+        # [İYİLEŞTİRME 15] Tıklanabilir başlık (topic düzenleme)
         self.chat_subtitle = tk.Label(hdr_left, text="Bir kanala katılın",
-                                      bg=BG, fg=MUTED, font=("Segoe UI", 9))
+                                      bg=BG, fg=MUTED, font=("Segoe UI", 9),
+                                      cursor="hand2")
         self.chat_subtitle.pack(side=tk.LEFT)
+        self.chat_subtitle.bind("<Button-1>", lambda e: self._edit_room_topic())
 
         hdr_right = tk.Frame(ch_hdr, bg=BG)
         hdr_right.pack(side=tk.RIGHT, padx=16)
 
-        # Arama butonu (mesaj araması)
         for sym, tip, cmd in [
-            ("🔍", "Mesajlarda ara", self._focus_chat_search),
+            ("🔍", "Mesajlarda ara",      self._focus_chat_search),
             ("📌", "Sabitlenmiş mesajlar", self._show_pinned),
+            ("📊", "İstatistikler",        self._show_room_stats),  # [İYİLEŞTİRME 11]
             ("🔔" if self.sound_enabled else "🔕", "Bildirim", self._toggle_sound),
         ]:
             lbl = tk.Label(hdr_right, text=sym, bg=BG, fg=MUTED,
-                           font=("Segoe UI", 12), cursor="hand2")
-            lbl.pack(side=tk.RIGHT, padx=6)
+                           font=("Segoe UI", 13), cursor="hand2", padx=4)
+            lbl.pack(side=tk.RIGHT, padx=4)
             self._hover(lbl, MUTED, TEXT)
             lbl.bind("<Button-1>", lambda e, c=cmd: c())
             if tip == "Bildirim":
@@ -827,8 +1097,10 @@ class OPSIPro:
         tk.Label(hdr_right, textvariable=self.screen_status_var,
                  bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side=tk.RIGHT)
 
-        # Mesaj arama çubuğu (gizli, açılır)
-        self.chat_search_frame = tk.Frame(main, bg=PANEL_2, height=42)
+        tk.Frame(main, bg=BORDER, height=1).pack(fill=tk.X)
+
+        # Mesaj arama çubuğu (gizli)
+        self.chat_search_frame = tk.Frame(main, bg=PANEL_2, height=44)
         self.chat_search_frame.pack_propagate(False)
         sch_inner = tk.Frame(self.chat_search_frame, bg=PANEL_2)
         sch_inner.pack(fill=tk.X, padx=16, pady=8)
@@ -842,12 +1114,27 @@ class OPSIPro:
         )
         self.chat_search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2, padx=8)
         self.chat_search_entry.bind("<Return>", lambda e: self._do_chat_search())
+        self.chat_search_entry.bind("<Escape>", lambda e: self._close_chat_search())
         self.search_var2.trace_add("write", lambda *a: self._do_chat_search())
+
+        # [İYİLEŞTİRME 16] İleri/geri arama navigasyonu
+        self._search_positions = []
+        self._search_pos_idx   = -1
+        nav_f = tk.Frame(sch_inner, bg=PANEL_2)
+        nav_f.pack(side=tk.LEFT)
+        self._prev_search_btn = tk.Label(nav_f, text="↑", bg=PANEL_2, fg=MUTED,
+                                          font=("Segoe UI", 12), cursor="hand2")
+        self._prev_search_btn.pack(side=tk.LEFT, padx=2)
+        self._prev_search_btn.bind("<Button-1>", lambda e: self._search_nav(-1))
+        self._next_search_btn = tk.Label(nav_f, text="↓", bg=PANEL_2, fg=MUTED,
+                                          font=("Segoe UI", 12), cursor="hand2")
+        self._next_search_btn.pack(side=tk.LEFT, padx=2)
+        self._next_search_btn.bind("<Button-1>", lambda e: self._search_nav(1))
 
         self.search_result_lbl = tk.Label(
             sch_inner, text="", bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9)
         )
-        self.search_result_lbl.pack(side=tk.LEFT)
+        self.search_result_lbl.pack(side=tk.LEFT, padx=(6, 0))
 
         close_sch = tk.Label(sch_inner, text="✕", bg=PANEL_2, fg=MUTED,
                              font=("Segoe UI", 11), cursor="hand2")
@@ -856,62 +1143,103 @@ class OPSIPro:
         close_sch.bind("<Button-1>", lambda e: self._close_chat_search())
         self._chat_search_open = False
 
+        # [İYİLEŞTİRME 17] Reply önizleme bandı
+        self.reply_bar = tk.Frame(main, bg=PANEL_2, height=44)
+        self.reply_bar.pack_propagate(False)
+        reply_inner = tk.Frame(self.reply_bar, bg=PANEL_2)
+        reply_inner.pack(fill=tk.X, padx=14, pady=8)
+        self.reply_icon_lbl = tk.Label(reply_inner, text="↩", bg=PANEL_2, fg=self.theme_accent,
+                                        font=("Segoe UI", 12))
+        self.reply_icon_lbl.pack(side=tk.LEFT, padx=(0, 6))
+        reply_text_f = tk.Frame(reply_inner, bg=PANEL_2)
+        reply_text_f.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.reply_sender_lbl = tk.Label(reply_text_f, text="", bg=PANEL_2, fg=self.theme_accent,
+                                          font=("Segoe UI", 9, "bold"), anchor="w")
+        self.reply_sender_lbl.pack(anchor="w")
+        self.reply_preview_lbl = tk.Label(reply_text_f, text="", bg=PANEL_2, fg=MUTED,
+                                           font=("Segoe UI", 9), anchor="w")
+        self.reply_preview_lbl.pack(anchor="w")
+        cancel_reply_lbl = tk.Label(reply_inner, text="✕", bg=PANEL_2, fg=MUTED,
+                                     font=("Segoe UI", 11), cursor="hand2")
+        cancel_reply_lbl.pack(side=tk.RIGHT)
+        self._hover(cancel_reply_lbl, MUTED, TEXT)
+        cancel_reply_lbl.bind("<Button-1>", lambda e: self._cancel_reply())
+        self._reply_bar_visible = False
+
         # Chat kutusu
         self.chat_box = scrolledtext.ScrolledText(
             main, bg=BG, fg=TEXT, insertbackground=TEXT,
             bd=0, highlightthickness=0, padx=16, pady=12,
-            font=("Segoe UI", 11), wrap=tk.WORD, relief=tk.FLAT, spacing3=3
+            font=("Segoe UI", self.font_size), wrap=tk.WORD, relief=tk.FLAT, spacing3=4
         )
         self.chat_box.pack(fill=tk.BOTH, expand=True)
         self.chat_box.configure(state=tk.DISABLED)
         self.chat_box.bind("<Button-3>", self._show_msg_context_menu)
         self.chat_box.bind("<Double-Button-1>", self._on_double_click_msg)
+        self.chat_box.bind("<Button-1>",  self._on_chat_click)
 
-        AI = 58
-        self.chat_box.tag_configure("time",       foreground=MUTED_2, font=("Segoe UI", 8))
-        self.chat_box.tag_configure("msg",        foreground=TEXT_2,  font=("Segoe UI", 11),
-                                    lmargin1=AI, lmargin2=AI)
-        self.chat_box.tag_configure("msg_cont",   foreground=TEXT_2,  font=("Segoe UI", 11),
-                                    lmargin1=AI, lmargin2=AI)
-        self.chat_box.tag_configure("msg_edited", foreground=MUTED,   font=("Segoe UI", 9, "italic"),
-                                    lmargin1=AI, lmargin2=AI)
-        self.chat_box.tag_configure("sys",        foreground=MUTED,   font=("Segoe UI", 9, "italic"),
-                                    lmargin1=20, lmargin2=20)
-        self.chat_box.tag_configure("warn",       foreground=WARN,    font=("Segoe UI", 9, "italic"),
-                                    lmargin1=20, lmargin2=20)
-        self.chat_box.tag_configure("danger",     foreground=DANGER,  font=("Segoe UI", 9, "italic"),
-                                    lmargin1=20, lmargin2=20)
-        self.chat_box.tag_configure("success_msg",foreground=SUCCESS, font=("Segoe UI", 9, "italic"),
-                                    lmargin1=20, lmargin2=20)
-        self.chat_box.tag_configure("self_name",  foreground="#79c0ff",font=("Segoe UI", 11, "bold"))
-        self.chat_box.tag_configure("user_name",  foreground=TEXT,    font=("Segoe UI", 11, "bold"))
-        self.chat_box.tag_configure("owner_name", foreground=GOLD,    font=("Segoe UI", 11, "bold"))
-        self.chat_box.tag_configure("audio",      foreground=ACCENT_2,font=("Segoe UI", 11),
-                                    lmargin1=AI, lmargin2=AI)
-        self.chat_box.tag_configure("owner_badge",foreground=GOLD,    font=("Segoe UI", 9))
-        self.chat_box.tag_configure("highlight",  background="#2f3d1a",foreground="#9ee87a")
-        self.chat_box.tag_configure("mention",    background=MENTION, foreground="#79c0ff")
-        self.chat_box.tag_configure("file",       foreground=ACCENT,  font=("Segoe UI", 11),
-                                    lmargin1=AI, lmargin2=AI)
-        self.chat_box.tag_configure("pinned_mark",foreground=GOLD,    font=("Segoe UI", 9))
-        self.chat_box.tag_configure("date_sep",   foreground=MUTED_2, font=("Segoe UI", 8, "bold"),
-                                    justify="center")
-        self.chat_box.tag_configure("link",       foreground=ACCENT,  font=("Segoe UI", 11, "underline"),
-                                    lmargin1=AI, lmargin2=AI)
+        AI = 62
+        fs = self.font_size
+        self.chat_box.tag_configure("time",        foreground=MUTED_2, font=("Segoe UI", 8))
+        self.chat_box.tag_configure("msg",         foreground=TEXT_2,  font=("Segoe UI", fs),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("msg_cont",    foreground=TEXT_2,  font=("Segoe UI", fs),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("msg_edited",  foreground=MUTED,   font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("sys",         foreground=MUTED,   font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=20, lmargin2=20)
+        self.chat_box.tag_configure("warn",        foreground=WARN,    font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=20, lmargin2=20)
+        self.chat_box.tag_configure("danger",      foreground=DANGER,  font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=20, lmargin2=20)
+        self.chat_box.tag_configure("success_msg", foreground=SUCCESS, font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=20, lmargin2=20)
+        self.chat_box.tag_configure("self_name",   foreground="#79c0ff",font=("Segoe UI", fs, "bold"))
+        self.chat_box.tag_configure("user_name",   foreground=TEXT,    font=("Segoe UI", fs, "bold"))
+        self.chat_box.tag_configure("owner_name",  foreground=GOLD,    font=("Segoe UI", fs, "bold"))
+        self.chat_box.tag_configure("audio",       foreground=ACCENT_2,font=("Segoe UI", fs),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("owner_badge", foreground=GOLD,    font=("Segoe UI", fs-2))
+        self.chat_box.tag_configure("highlight",   background="#2f3d1a",foreground="#9ee87a")
+        self.chat_box.tag_configure("mention",     background=MENTION, foreground="#79c0ff")
+        self.chat_box.tag_configure("file",        foreground=ACCENT,  font=("Segoe UI", fs),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("pinned_mark", foreground=GOLD,    font=("Segoe UI", fs-2))
+        self.chat_box.tag_configure("date_sep",    foreground=MUTED_2, font=("Segoe UI", 8, "bold"),
+                                     justify="center")
+        self.chat_box.tag_configure("link",        foreground=ACCENT,  font=("Segoe UI", fs, "underline"),
+                                     lmargin1=AI, lmargin2=AI)
+        self.chat_box.tag_configure("reply_quote", foreground=MUTED,   font=("Segoe UI", fs-2, "italic"),
+                                     lmargin1=AI+8, lmargin2=AI+8, background=REPLY_BG)  # [İYİLEŞTİRME 17]
+        self.chat_box.tag_configure("code_inline", foreground=TEAL,    font=("Courier New", fs-1),
+                                     background="#161b22")  # [İYİLEŞTİRME 18]
 
         # Yazıyor... göstergesi
         self.typing_lbl = tk.Label(
             main, textvariable=self.typing_var,
             bg=BG, fg=MUTED, font=("Segoe UI", 8, "italic"),
-            anchor="w"
+            anchor="w", height=1
         )
         self.typing_lbl.pack(fill=tk.X, padx=20)
+
+        # [İYİLEŞTİRME 19] Scroll-to-bottom butonu
+        self._scroll_btn_visible = False
+        self.scroll_btn = tk.Label(
+            main, text="▼  Aşağı", bg=PANEL_2, fg=MUTED_2,
+            font=("Segoe UI", 9), cursor="hand2", padx=10, pady=4
+        )
+        self.scroll_btn.bind("<Button-1>", lambda e: self._scroll_to_bottom())
+        self.chat_box.bind("<MouseWheel>",   self._on_chat_scroll)
+        self.chat_box.bind("<Button-4>",     self._on_chat_scroll)
+        self.chat_box.bind("<Button-5>",     self._on_chat_scroll)
 
         # Giriş alanı
         input_outer = tk.Frame(main, bg=BG)
         input_outer.pack(fill=tk.X, padx=16, pady=(2, 14))
 
-        input_box = tk.Frame(input_outer, bg=INPUT)
+        input_box = tk.Frame(input_outer, bg=INPUT, bd=0, highlightthickness=1,
+                             highlightcolor=BORDER_2, highlightbackground=BORDER)
         input_box.pack(fill=tk.X)
 
         def icon_btn(parent, text, cmd=None, hover_fg=TEXT, size=14):
@@ -926,20 +1254,24 @@ class OPSIPro:
         icon_btn(input_box, "🖼️",  self.send_image)
         icon_btn(input_box, "📎",  self.send_file)
         self.screen_icon = icon_btn(input_box, "🖥️", self._toggle_screen_share)
-        icon_btn(input_box, "🎁",  self._send_gif_placeholder)
+        icon_btn(input_box, "🎁",  self._show_gif_window)  # [İYİLEŞTİRME 20]
 
-        # Separator
         tk.Frame(input_box, bg=BORDER, width=1, height=24).pack(side=tk.LEFT, padx=4, pady=8)
 
-        self.msg_entry = tk.Entry(
+        self.msg_entry = tk.Text(
             input_box, bg=INPUT, fg=TEXT,
             insertbackground=TEXT, bd=0,
-            font=("Segoe UI", 11), relief=tk.FLAT
+            font=("Segoe UI", self.font_size), relief=tk.FLAT,
+            height=1, wrap=tk.WORD, undo=True
         )
-        self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=12, padx=8)
-        self.msg_entry.bind("<Return>",    lambda e: self.send_message())
-        self.msg_entry.bind("<KeyRelease>",self._on_typing)
-        self.msg_entry.bind("<Up>",        self._edit_last_message)
+        self.msg_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8, padx=6)
+        self.msg_entry.bind("<Return>",         self._on_entry_return)
+        self.msg_entry.bind("<Shift-Return>",   self._on_shift_return)  # [İYİLEŞTİRME 21]
+        self.msg_entry.bind("<KeyRelease>",     self._on_typing)
+        self.msg_entry.bind("<Up>",             self._hist_prev)        # [İYİLEŞTİRME 3]
+        self.msg_entry.bind("<Down>",           self._hist_next)
+        self.msg_entry.bind("<Tab>",            self._autocomplete_mention)  # [İYİLEŞTİRME 22]
+        self.msg_entry.bind("<Configure>",      self._auto_resize_entry)
 
         # Sağ ikonlar
         emoji_lbl = icon_btn(input_box, "😊", self._show_emoji_picker, WARN, size=15)
@@ -953,21 +1285,29 @@ class OPSIPro:
         self.mic_btn.bind("<ButtonRelease-1>", self._stop_audio_record)
 
         self.send_btn = tk.Label(
-            input_box, text="➤", bg=INPUT, fg=ACCENT,
+            input_box, text="➤", bg=INPUT, fg=self.theme_accent,
             font=("Segoe UI", 14, "bold"), cursor="hand2", padx=8
         )
         self.send_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self._hover(self.send_btn, ACCENT, ACCENT_H)
+        self._hover(self.send_btn, self.theme_accent, ACCENT_H)
         self.send_btn.bind("<Button-1>", lambda e: self.send_message())
 
-        # Karakter sayacı
-        self.char_count_lbl = tk.Label(
-            input_outer, text="", bg=BG, fg=MUTED_2, font=("Segoe UI", 7)
-        )
-        self.char_count_lbl.pack(anchor="e")
+        # Alt bilgi çubuğu
+        info_row = tk.Frame(input_outer, bg=BG)
+        info_row.pack(fill=tk.X, pady=(3, 0))
 
-        tk.Label(input_outer, textvariable=self.audio_status_var,
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8, "italic")).pack(anchor="e")
+        self.char_count_lbl = tk.Label(
+            info_row, text="", bg=BG, fg=MUTED_2, font=("Segoe UI", 7)
+        )
+        self.char_count_lbl.pack(side=tk.RIGHT)
+
+        tk.Label(info_row, textvariable=self.audio_status_var,
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8, "italic")).pack(side=tk.LEFT)
+
+        # [İYİLEŞTİRME 23] Klavye ipuçları
+        shortcut_lbl = tk.Label(info_row, text="Enter: Gönder  •  Shift+Enter: Yeni satır  •  ↑/↓: Geçmiş  •  Tab: @tamamla",
+                                 bg=BG, fg=MUTED_2, font=("Segoe UI", 7))
+        shortcut_lbl.pack(side=tk.LEFT, padx=6)
 
         # Context menü
         self.msg_ctx_menu = tk.Menu(
@@ -975,19 +1315,19 @@ class OPSIPro:
             activebackground=ACCENT_S, activeforeground=TEXT,
             bd=0, relief=tk.FLAT, font=("Segoe UI", 10)
         )
-        self.msg_ctx_menu.add_command(label="  ✏️  Düzenle",          command=self._edit_my_message)
-        self.msg_ctx_menu.add_command(label="  🗑️  Sil",               command=self._delete_my_message)
-        self.msg_ctx_menu.add_command(label="  📌  Sabitle",           command=self._pin_message)
+        self.msg_ctx_menu.add_command(label="  ✏️  Düzenle",           command=self._edit_my_message)
+        self.msg_ctx_menu.add_command(label="  🗑️  Sil",                command=self._delete_my_message)
+        self.msg_ctx_menu.add_command(label="  📌  Sabitle / Kaldır",   command=self._pin_message)
         self.msg_ctx_menu.add_separator()
-        self.msg_ctx_menu.add_command(label="  📋  Kopyala",           command=self._copy_message_text)
-        self.msg_ctx_menu.add_command(label="  💬  Yanıtla",           command=self._reply_to_message)
-        self.msg_ctx_menu.add_command(label="  😊  Tepki ver",         command=self._add_reaction)
+        self.msg_ctx_menu.add_command(label="  📋  Kopyala",            command=self._copy_message_text)
+        self.msg_ctx_menu.add_command(label="  💬  Yanıtla",            command=self._set_reply_from_ctx)
+        self.msg_ctx_menu.add_command(label="  😊  Tepki ver",          command=self._add_reaction)
+        self.msg_ctx_menu.add_separator()
+        self.msg_ctx_menu.add_command(label="  🔗  Mesaj ID kopyala",   command=self._copy_msg_id)  # [İYİLEŞTİRME 24]
         self._ctx_item_id = None
 
         self._toggle_inputs(False)
-        self.msg_entry.config(
-            state=tk.DISABLED
-        )
+        self.msg_entry.config(state=tk.DISABLED)
 
     # ==================== YARDIMCI ====================
     def _hover(self, widget, fg_normal, fg_hover):
@@ -1002,6 +1342,54 @@ class OPSIPro:
     def _on_escape(self, event=None):
         if self._chat_search_open:
             self._close_chat_search()
+        elif self._reply_bar_visible:
+            self._cancel_reply()
+
+    def _on_entry_return(self, event):
+        self.send_message()
+        return "break"
+
+    def _on_shift_return(self, event):
+        """[İYİLEŞTİRME 21] Shift+Enter yeni satır ekler"""
+        self.msg_entry.insert(tk.INSERT, "\n")
+        self._auto_resize_entry()
+        return "break"
+
+    def _auto_resize_entry(self, event=None):
+        """Giriş kutusu içeriğe göre büyür (maks 4 satır)"""
+        lines = int(self.msg_entry.index(tk.END).split(".")[0])
+        new_h = min(max(1, lines), 4)
+        self.msg_entry.config(height=new_h)
+
+    def _get_entry_text(self) -> str:
+        return self.msg_entry.get("1.0", tk.END).rstrip("\n")
+
+    def _clear_entry(self):
+        self.msg_entry.delete("1.0", tk.END)
+        self.msg_entry.config(height=1)
+
+    # ==================== SCROLL ====================
+    def _on_chat_scroll(self, event=None):
+        """Yukarı kaydırıldığında 'Aşağı' butonu göster"""
+        try:
+            pos = self.chat_box.yview()
+            if pos[1] < 0.99 and not self._scroll_btn_visible:
+                self.scroll_btn.place(relx=0.5, rely=0.99, anchor="s",
+                                      in_=self.chat_box, x=0, y=-6)
+                self._scroll_btn_visible = True
+            elif pos[1] >= 0.99 and self._scroll_btn_visible:
+                self.scroll_btn.place_forget()
+                self._scroll_btn_visible = False
+        except Exception:
+            pass
+
+    def _scroll_to_bottom(self):
+        self.chat_box.see(tk.END)
+        try:
+            self.scroll_btn.place_forget()
+            self._scroll_btn_visible = False
+        except Exception:
+            pass
 
     # ==================== AYARLAR ====================
     def _show_settings(self):
@@ -1010,147 +1398,328 @@ class OPSIPro:
             return
         win = tk.Toplevel(self.root)
         win.title("Kullanıcı Ayarları — OPSI Pro")
-        win.geometry("500x480")
+        win.geometry("560x620")
         win.configure(bg=PANEL)
         win.resizable(False, False)
+        win.attributes("-topmost", True)
         self._swin = win
 
         # Header
-        hdr = tk.Frame(win, bg=PANEL_3, height=56)
+        hdr = tk.Frame(win, bg=PANEL_3, height=60)
         hdr.pack(fill=tk.X)
         hdr.pack_propagate(False)
         tk.Label(hdr, text="⚙  Ayarlar", bg=PANEL_3, fg=TEXT,
-                 font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT, padx=20, pady=16)
+                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT, padx=20, pady=18)
+        tk.Label(hdr, text=f"v{APP_VERSION}", bg=PANEL_3, fg=MUTED_2,
+                 font=("Segoe UI", 9)).pack(side=tk.RIGHT, padx=20)
+        tk.Frame(win, bg=self.theme_accent, height=2).pack(fill=tk.X)
 
         # Scroll frame
         canvas = tk.Canvas(win, bg=PANEL, highlightthickness=0)
-        sb     = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        sb_sc  = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb_sc.set)
+        sb_sc.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(fill=tk.BOTH, expand=True)
         inner = tk.Frame(canvas, bg=PANEL)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.create_window((0, 0), window=inner, anchor="nw", width=560)
         inner.bind("<Configure>", lambda e: canvas.configure(
             scrollregion=canvas.bbox("all")))
 
         def section(t, parent=inner):
-            tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=(16, 8))
+            tk.Frame(parent, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=(18, 8))
             tk.Label(parent, text=t, bg=PANEL, fg=MUTED_2,
                      font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=20, pady=(0, 8))
-
-        def labeled_row(label, widget_builder, parent=inner):
-            f = tk.Frame(parent, bg=PANEL)
-            f.pack(fill=tk.X, padx=20, pady=4)
-            tk.Label(f, text=label, bg=PANEL, fg=TEXT,
-                     font=("Segoe UI", 10), width=18, anchor="w").pack(side=tk.LEFT)
-            widget_builder(f)
 
         # Profil
         section("PROFİL")
         prof_f = tk.Frame(inner, bg=PANEL)
         prof_f.pack(fill=tk.X, padx=20, pady=4)
         me  = self.username_var.get().strip()
-        av  = self._get_avatar_image(me, 52)
+        av  = self._get_avatar_image(me, 56)
         self.avatar_refs.append(av)
         av_lbl = tk.Label(prof_f, image=av, bg=PANEL, cursor="hand2")
         av_lbl.image = av
         av_lbl.pack(side=tk.LEFT)
-        av_lbl.bind("<Button-1>", lambda e: self._pick_profile_photo())
+        av_lbl.bind("<Button-1>", lambda e: (self._pick_profile_photo(), win.lift()))
+
         name_col = tk.Frame(prof_f, bg=PANEL)
-        name_col.pack(side=tk.LEFT, padx=12, fill=tk.X, expand=True)
+        name_col.pack(side=tk.LEFT, padx=14, fill=tk.X, expand=True)
         tk.Label(name_col, text="Kullanıcı adı", bg=PANEL, fg=MUTED_2,
                  font=("Segoe UI", 8)).pack(anchor="w")
-        tk.Entry(name_col, textvariable=self.username_var,
-                 bg=INPUT, fg=TEXT, insertbackground=TEXT,
-                 bd=0, font=("Segoe UI", 11)).pack(fill=tk.X, ipady=7)
-        tk.Button(prof_f, text="📷 Fotoğraf", bg=ACCENT_S, fg="white",
+        name_entry = tk.Entry(name_col, textvariable=self.username_var,
+                              bg=INPUT, fg=TEXT, insertbackground=TEXT,
+                              bd=0, font=("Segoe UI", 11))
+        name_entry.pack(fill=tk.X, ipady=7)
+
+        btn_col = tk.Frame(prof_f, bg=PANEL)
+        btn_col.pack(side=tk.LEFT, padx=(10, 0))
+        tk.Button(btn_col, text="📷 Fotoğraf", bg=ACCENT_S, fg="white",
                   bd=0, font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2",
-                  activebackground=ACCENT,
+                  activebackground=self.theme_accent,
                   command=lambda: (self._pick_profile_photo(), win.lift())
-                  ).pack(side=tk.LEFT, padx=(8, 0))
+                  ).pack(pady=(0, 4))
+        tk.Button(btn_col, text="🗑️ Sıfırla", bg=PANEL_2, fg=MUTED,
+                  bd=0, font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2",
+                  command=lambda: self._reset_avatar(me, win)).pack()
 
         # Durum
         section("DURUM")
         status_var = tk.StringVar(value=self.user_status)
         status_f   = tk.Frame(inner, bg=PANEL)
         status_f.pack(fill=tk.X, padx=20, pady=4)
-        for status, label, col in [
-            ("online",  "🟢  Çevrimiçi", SUCCESS),
-            ("away",    "🟡  Uzakta",    WARN),
-            ("dnd",     "🔴  Rahatsız etme", DANGER),
-            ("offline", "⚫  Görünmez", MUTED),
-        ]:
+        for i, (status, label, col) in enumerate([
+            ("online",  "🟢  Çevrimiçi",    SUCCESS),
+            ("away",    "🟡  Uzakta",        WARN),
+            ("dnd",     "🔴  Rahatsız Etme", DANGER),
+            ("offline", "⚫  Görünmez",      MUTED),
+        ]):
             rb = tk.Radiobutton(status_f, text=label, variable=status_var, value=status,
-                                bg=PANEL, fg=TEXT, selectcolor=PANEL,
+                                bg=PANEL, fg=TEXT, selectcolor=INPUT, indicatoron=True,
                                 activebackground=PANEL, font=("Segoe UI", 10))
-            rb.pack(anchor="w")
+            rb.grid(row=i//2, column=i%2, sticky="w", padx=8, pady=2)
 
-        # Bildirim
+        # Bildirim & Ses
         section("BİLDİRİM & SES")
-        snd_var = tk.BooleanVar(value=self.sound_enabled)
-        def toggle_snd():
-            self.sound_enabled = snd_var.get()
-            self.sound_lbl.config(text="🔔" if self.sound_enabled else "🔕")
-        tk.Checkbutton(inner, text="Mesaj sesi etkin", variable=snd_var,
-                       bg=PANEL, fg=TEXT, selectcolor=PANEL, activebackground=PANEL,
-                       command=toggle_snd, font=("Segoe UI", 10)).pack(anchor="w", padx=20)
+        snd_var     = tk.BooleanVar(value=self.sound_enabled)
+        mention_var = tk.BooleanVar(value=self.notify_mentions_only)
+        prev_var    = tk.BooleanVar(value=self.message_preview)
+
+        for var, text, cmd in [
+            (snd_var,     "Mesaj sesi etkin",           lambda: None),
+            (mention_var, "Yalnız @mention'da bildir",  lambda: None),
+            (prev_var,    "Toast bildirim içeriği göster", lambda: None),
+        ]:
+            tk.Checkbutton(inner, text=text, variable=var,
+                           bg=PANEL, fg=TEXT, selectcolor=INPUT, activebackground=PANEL,
+                           font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=2)
 
         # Görünüm
         section("GÖRÜNÜM")
         compact_var = tk.BooleanVar(value=self.compact_mode)
         ts_var      = tk.BooleanVar(value=self.show_timestamps)
-        tk.Checkbutton(inner, text="Kompakt mesaj görünümü", variable=compact_var,
-                       bg=PANEL, fg=TEXT, selectcolor=PANEL, activebackground=PANEL,
-                       font=("Segoe UI", 10)).pack(anchor="w", padx=20)
-        tk.Checkbutton(inner, text="Zaman damgaları göster", variable=ts_var,
-                       bg=PANEL, fg=TEXT, selectcolor=PANEL, activebackground=PANEL,
-                       font=("Segoe UI", 10)).pack(anchor="w", padx=20)
+        for var, text in [
+            (compact_var, "Kompakt mesaj görünümü"),
+            (ts_var,      "Zaman damgaları göster"),
+        ]:
+            tk.Checkbutton(inner, text=text, variable=var,
+                           bg=PANEL, fg=TEXT, selectcolor=INPUT, activebackground=PANEL,
+                           font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=2)
+
+        # Yazı boyutu
+        fs_row = tk.Frame(inner, bg=PANEL)
+        fs_row.pack(fill=tk.X, padx=20, pady=6)
+        tk.Label(fs_row, text="Yazı boyutu:", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT)
+        fs_var = tk.IntVar(value=self.font_size)
+        for sz in [9, 10, 11, 12, 13, 14]:
+            tk.Radiobutton(fs_row, text=str(sz), variable=fs_var, value=sz,
+                           bg=PANEL, fg=TEXT, selectcolor=INPUT,
+                           activebackground=PANEL, font=("Segoe UI", 10)
+                           ).pack(side=tk.LEFT, padx=4)
 
         # Tema rengi
         section("TEMA AKSANI")
         theme_f = tk.Frame(inner, bg=PANEL)
         theme_f.pack(fill=tk.X, padx=20, pady=4)
-        for color in ["#388bfd","#3fb950","#bc8cff","#f85149","#d29922","#39c5cf"]:
-            c_lbl = tk.Label(theme_f, text="  ", bg=color, cursor="hand2",
-                             width=3, height=1, relief="flat")
-            c_lbl.pack(side=tk.LEFT, padx=3)
+        selected_color = tk.StringVar(value=self.theme_accent)
+        for name, color in THEMES.items():
+            col_f = tk.Frame(theme_f, bg=PANEL)
+            col_f.pack(side=tk.LEFT, padx=4)
+            c_lbl = tk.Label(col_f, bg=color, cursor="hand2", width=3, height=1)
+            c_lbl.pack()
+            tk.Label(col_f, text=name.split()[0], bg=PANEL, fg=MUTED_2,
+                     font=("Segoe UI", 7)).pack()
             if color == self.theme_accent:
                 c_lbl.config(relief="ridge", bd=2)
-            c_lbl.bind("<Button-1>", lambda e, col=color: self._set_accent(col, win))
+            c_lbl.bind("<Button-1>", lambda e, col=color, lbl=c_lbl:
+                       (selected_color.set(col), self._preview_accent(col)))
 
         # Kaydet
-        tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=16)
+        tk.Frame(inner, bg=BORDER, height=1).pack(fill=tk.X, padx=20, pady=18)
         btn_row = tk.Frame(inner, bg=PANEL)
-        btn_row.pack(fill=tk.X, padx=20, pady=(0, 20))
+        btn_row.pack(fill=tk.X, padx=20, pady=(0, 24))
 
         def on_save():
-            self.compact_mode    = compact_var.get()
-            self.show_timestamps = ts_var.get()
-            self.user_status     = status_var.get()
-            if hasattr(self, "user_status_dot"):
-                self.user_status_dot.config(fg=STATUS_COLORS.get(self.user_status, SUCCESS))
+            self.compact_mode         = compact_var.get()
+            self.show_timestamps      = ts_var.get()
+            self.sound_enabled        = snd_var.get()
+            self.notify_mentions_only = mention_var.get()
+            self.message_preview      = prev_var.get()
+            self.font_size            = fs_var.get()
+            new_status = status_var.get()
+            if new_status != self.user_status:
+                col = STATUS_COLORS.get(new_status, SUCCESS)
+                self._set_status(new_status, col)
+            new_accent = selected_color.get()
+            if new_accent != self.theme_accent:
+                self.theme_accent = new_accent
+            self.sound_lbl.config(text="🔔" if self.sound_enabled else "🔕")
+            if hasattr(self, "sound_panel_lbl"):
+                self.sound_panel_lbl.config(text="🔇" if not self.sound_enabled else "🔔")
             self._save_config()
             win.destroy()
+            self._system_message("✅ Ayarlar kaydedildi.", SUCCESS)
 
         tk.Button(btn_row, text="Kaydet", bg=ACCENT_S, fg="white",
-                  bd=0, font=("Segoe UI", 10, "bold"), padx=24, pady=8,
-                  cursor="hand2", activebackground=ACCENT, command=on_save
+                  bd=0, font=("Segoe UI", 10, "bold"), padx=28, pady=9,
+                  cursor="hand2", activebackground=self.theme_accent, command=on_save
                   ).pack(side=tk.RIGHT)
         tk.Button(btn_row, text="İptal", bg=PANEL_2, fg=MUTED,
-                  bd=0, font=("Segoe UI", 10), padx=20, pady=8,
+                  bd=0, font=("Segoe UI", 10), padx=22, pady=9,
                   cursor="hand2", activebackground=HOVER, command=win.destroy
                   ).pack(side=tk.RIGHT, padx=(0, 8))
 
-    def _set_accent(self, color, win=None):
-        self.theme_accent = color
-        # Update accent references where possible
+    def _reset_avatar(self, me, win=None):
+        self.avatar_b64_map.pop(me, None)
+        for k in list(self.avatar_cache):
+            if k.startswith(f"{me}_"):
+                del self.avatar_cache[k]
+        self._update_own_avatar_display()
         if win:
             win.lift()
 
+    def _preview_accent(self, color):
+        """Geçici tema önizleme"""
+        pass
+
     def _toggle_sound(self, event=None):
         self.sound_enabled = not self.sound_enabled
-        self.sound_lbl.config(text="🔔" if self.sound_enabled else "🔕")
+        sym = "🔔" if self.sound_enabled else "🔕"
+        self.sound_lbl.config(text=sym)
+        if hasattr(self, "sound_panel_lbl"):
+            self.sound_panel_lbl.config(text="🔇" if not self.sound_enabled else "🔔")
         self._save_config()
+
+    # ==================== İSTATİSTİK ====================
+    def _show_stats_window(self):
+        """[İYİLEŞTİRME 11] Global istatistik penceresi"""
+        win = tk.Toplevel(self.root)
+        win.title("OPSI Pro — Oturum İstatistikleri")
+        win.geometry("420x380")
+        win.configure(bg=PANEL)
+        win.attributes("-topmost", True)
+
+        tk.Frame(win, bg=self.theme_accent, height=3).pack(fill=tk.X)
+        tk.Label(win, text="📊  Oturum İstatistikleri", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 14, "bold")).pack(padx=20, pady=(20, 12), anchor="w")
+
+        uptime = int(time.time() - self._stats["start_time"])
+        h, r   = divmod(uptime, 3600)
+        m, s   = divmod(r, 60)
+
+        data = [
+            ("⏱  Oturum süresi",      f"{h:02d}:{m:02d}:{s:02d}"),
+            ("📤  Gönderilen paket",   str(self._stats["sent"])),
+            ("📥  Alınan paket",       str(self._stats["recv"])),
+            ("❌  Hata sayısı",        str(self._stats["errors"])),
+            ("🏠  Bilinen oda",        str(len(self.known_rooms))),
+            ("💬  Aktif oda",          self.current_room or "—"),
+            ("👤  Kullanıcı adı",      self.username_var.get().strip()),
+            ("🌐  Port",               str(PORT)),
+        ]
+        if AUDIO_AVAILABLE:
+            data.append(("🎤  Ses desteği", "Aktif"))
+        else:
+            data.append(("🎤  Ses desteği", "Yok (sounddevice eksik)"))
+
+        for label, value in data:
+            row = tk.Frame(win, bg=PANEL_2)
+            row.pack(fill=tk.X, padx=20, pady=2)
+            tk.Label(row, text=f"  {label}", bg=PANEL_2, fg=MUTED,
+                     font=("Segoe UI", 10), width=22, anchor="w").pack(side=tk.LEFT, pady=6)
+            tk.Label(row, text=value, bg=PANEL_2, fg=TEXT,
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(side=tk.LEFT, padx=8)
+
+        tk.Button(win, text="Kapat", bg=PANEL_3, fg=MUTED,
+                  bd=0, font=("Segoe UI", 9), padx=16, pady=7,
+                  cursor="hand2", command=win.destroy).pack(pady=16)
+
+    def _show_room_stats(self):
+        """Mevcut oda istatistikleri"""
+        if not self.current_room:
+            return
+        items  = list(self.room_history[self.current_room])
+        msgs   = [x for x in items if x.kind == "MSG"]
+        imgs   = [x for x in items if x.kind == "IMG"]
+        audios = [x for x in items if x.kind == "AUDIO"]
+        files  = [x for x in items if x.kind == "FILE"]
+        users  = self.room_users.get(self.current_room, {})
+        now    = time.time()
+        online = [u for u, t in users.items() if now - t < STALE_USER_SEC]
+
+        sender_count = defaultdict(int)
+        for m in msgs:
+            sender_count[m.sender] += 1
+        top_sender = max(sender_count, key=sender_count.get) if sender_count else "—"
+
+        win = tk.Toplevel(self.root)
+        win.title(f"#{self.current_room} — İstatistikler")
+        win.geometry("380x400")
+        win.configure(bg=PANEL)
+        win.attributes("-topmost", True)
+
+        tk.Frame(win, bg=self.theme_accent, height=3).pack(fill=tk.X)
+        tk.Label(win, text=f"📊  #{self.current_room}", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 14, "bold")).pack(padx=20, pady=(18, 12), anchor="w")
+
+        data = [
+            ("💬  Toplam mesaj",    str(len(msgs))),
+            ("🖼️  Fotoğraf",        str(len(imgs))),
+            ("🎤  Ses mesajı",      str(len(audios))),
+            ("📎  Dosya",           str(len(files))),
+            ("👥  Çevrimiçi üye",  str(len(online))),
+            ("👑  Oda kurucusu",    self.room_owner.get(self.current_room, "—")),
+            ("🏆  En aktif üye",    f"{top_sender} ({sender_count.get(top_sender, 0)})"),
+        ]
+        for label, value in data:
+            row = tk.Frame(win, bg=PANEL_2)
+            row.pack(fill=tk.X, padx=20, pady=2)
+            tk.Label(row, text=f"  {label}", bg=PANEL_2, fg=MUTED,
+                     font=("Segoe UI", 10), width=18, anchor="w").pack(side=tk.LEFT, pady=7)
+            tk.Label(row, text=value, bg=PANEL_2, fg=TEXT,
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(side=tk.LEFT, padx=8)
+
+        tk.Button(win, text="Kapat", bg=PANEL_3, fg=MUTED,
+                  bd=0, font=("Segoe UI", 9), padx=16, pady=7,
+                  cursor="hand2", command=win.destroy).pack(pady=16)
+
+    # ==================== TOPIC ====================
+    def _edit_room_topic(self):
+        """[İYİLEŞTİRME 15] Oda başlığı düzenleme"""
+        if not self.current_room or not self._is_owner(self.current_room):
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Kanal Konusu")
+        win.geometry("440x160")
+        win.configure(bg=PANEL)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+
+        tk.Label(win, text="Kanal konusu:", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(16, 4))
+        entry = tk.Entry(win, bg=INPUT, fg=TEXT, insertbackground=TEXT,
+                         bd=0, font=("Segoe UI", 11))
+        entry.pack(fill=tk.X, padx=20, ipady=9)
+        entry.insert(0, self.room_topics.get(self.current_room, ""))
+        entry.focus_set()
+
+        def save():
+            topic = entry.get().strip()
+            self.room_topics[self.current_room] = topic
+            display = topic or f"Kurucu: {self.room_owner.get(self.current_room, 'bilinmiyor')}"
+            self.chat_subtitle.config(text=display)
+            win.destroy()
+
+        entry.bind("<Return>", lambda e: save())
+        btn_row = tk.Frame(win, bg=PANEL)
+        btn_row.pack(fill=tk.X, padx=20, pady=12)
+        tk.Button(btn_row, text="Kaydet", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 10, "bold"), padx=20, pady=7,
+                  cursor="hand2", activebackground=self.theme_accent, command=save
+                  ).pack(side=tk.RIGHT)
+        tk.Button(btn_row, text="İptal", bg=PANEL_2, fg=MUTED,
+                  bd=0, font=("Segoe UI", 10), padx=16, pady=7,
+                  cursor="hand2", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
     # ==================== MESAJ ARAMA ====================
     def _focus_search(self, event=None):
@@ -1158,41 +1727,53 @@ class OPSIPro:
 
     def _focus_chat_search(self):
         if not self._chat_search_open:
-            self.chat_search_frame.pack(fill=tk.X, after=self.chat_box if False else None,
-                                        before=self.chat_box)
+            self.chat_search_frame.pack(fill=tk.X, before=self.chat_box)
             self._chat_search_open = True
         self.chat_search_entry.focus_set()
+        self.chat_search_entry.select_range(0, tk.END)
 
     def _close_chat_search(self):
         self.chat_search_frame.pack_forget()
         self._chat_search_open = False
         self.chat_box.tag_remove("highlight", "1.0", tk.END)
         self.search_result_lbl.config(text="")
+        self._search_positions.clear()
+        self._search_pos_idx = -1
 
     def _do_chat_search(self):
         query = self.search_var2.get().strip().lower()
         self.chat_box.tag_remove("highlight", "1.0", tk.END)
+        self._search_positions.clear()
+        self._search_pos_idx = -1
         if not query:
             self.search_result_lbl.config(text="")
             return
-        count = 0
         start = "1.0"
-        first = None
         while True:
             pos = self.chat_box.search(query, start, stopindex=tk.END, nocase=True)
             if not pos:
                 break
             end = f"{pos}+{len(query)}c"
             self.chat_box.tag_add("highlight", pos, end)
-            if count == 0:
-                first = pos
-            count += 1
+            self._search_positions.append(pos)
             start = end
-        if first:
-            self.chat_box.see(first)
+        count = len(self._search_positions)
+        if count:
+            self._search_pos_idx = 0
+            self.chat_box.see(self._search_positions[0])
         self.search_result_lbl.config(
             text=f"{count} sonuç" if count else "Sonuç yok",
             fg=MUTED if count else DANGER
+        )
+
+    def _search_nav(self, direction):
+        """[İYİLEŞTİRME 16] İleri/geri arama navigasyonu"""
+        if not self._search_positions:
+            return
+        self._search_pos_idx = (self._search_pos_idx + direction) % len(self._search_positions)
+        self.chat_box.see(self._search_positions[self._search_pos_idx])
+        self.search_result_lbl.config(
+            text=f"{self._search_pos_idx + 1} / {len(self._search_positions)}"
         )
 
     # ==================== EMOJİ ====================
@@ -1206,8 +1787,7 @@ class OPSIPro:
         win.configure(bg=PANEL_2)
         cols = 8
         rows = math.ceil(len(EMOJI_LIST) / cols)
-        w, h = cols * 42 + 16, rows * 42 + 16
-        # Pozisyon
+        w, h = cols * 44 + 20, rows * 44 + 56
         try:
             x = self.msg_entry.winfo_rootx()
             y = self.msg_entry.winfo_rooty() - h - 8
@@ -1216,8 +1796,18 @@ class OPSIPro:
         win.geometry(f"{w}x{h}+{x}+{y}")
         self._emoji_win = win
 
+        # Başlık + arama
+        top_f = tk.Frame(win, bg=PANEL_2)
+        top_f.pack(fill=tk.X, padx=8, pady=6)
+        tk.Label(top_f, text="Emoji Seç", bg=PANEL_2, fg=TEXT,
+                 font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        close_e = tk.Label(top_f, text="✕", bg=PANEL_2, fg=MUTED,
+                           font=("Segoe UI", 10), cursor="hand2")
+        close_e.pack(side=tk.RIGHT)
+        close_e.bind("<Button-1>", lambda e: win.destroy())
+
         grid = tk.Frame(win, bg=PANEL_2)
-        grid.pack(padx=8, pady=8)
+        grid.pack(padx=8, pady=(0, 8))
         for i, emoji in enumerate(EMOJI_LIST):
             r, c = divmod(i, cols)
             lbl  = tk.Label(grid, text=emoji, bg=PANEL_2, fg=TEXT,
@@ -1231,10 +1821,27 @@ class OPSIPro:
         win.focus_set()
 
     def _insert_emoji(self, emoji, win):
-        pos = self.msg_entry.index(tk.INSERT)
-        self.msg_entry.insert(pos, emoji)
+        self.msg_entry.insert(tk.INSERT, emoji)
         win.destroy()
         self.msg_entry.focus_set()
+
+    # [İYİLEŞTİRME 20] GIF placeholder penceresi
+    def _show_gif_window(self):
+        win = tk.Toplevel(self.root)
+        win.title("GIF Gönder")
+        win.geometry("360x200")
+        win.configure(bg=PANEL)
+        win.attributes("-topmost", True)
+
+        tk.Label(win, text="🎁", bg=PANEL, fg=self.theme_accent,
+                 font=("Segoe UI", 40)).pack(pady=(24, 8))
+        tk.Label(win, text="GIF Desteği Yakında!", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 13, "bold")).pack()
+        tk.Label(win, text="Bu özellik bir sonraki sürümde eklenecek.", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(pady=4)
+        tk.Button(win, text="Tamam", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 10, "bold"), padx=20, pady=7,
+                  cursor="hand2", activebackground=self.theme_accent, command=win.destroy).pack(pady=12)
 
     # ==================== MESAJ CONTEXT MENÜ ====================
     def _show_msg_context_menu(self, event):
@@ -1261,8 +1868,26 @@ class OPSIPro:
         for tag in self.chat_box.tag_names(idx):
             if tag.startswith("item_"):
                 self._ctx_item_id = tag[5:]
-                self._edit_my_message()
+                me = self.username_var.get().strip()
+                item = self._get_ctx_item()
+                if item and item.sender == me and item.kind == "MSG":
+                    self._edit_my_message()
                 return
+
+    def _on_chat_click(self, event):
+        """Link tıklama desteği"""
+        idx = self.chat_box.index(f"@{event.x},{event.y}")
+        tags = self.chat_box.tag_names(idx)
+        if "link" in tags:
+            # URL'yi al
+            range_start = self.chat_box.tag_prevrange("link", idx)
+            if range_start:
+                url = self.chat_box.get(*range_start)
+                try:
+                    import webbrowser
+                    webbrowser.open(url)
+                except Exception:
+                    pass
 
     def _get_ctx_item(self):
         if not self._ctx_item_id or not self.current_room:
@@ -1278,25 +1903,28 @@ class OPSIPro:
             return
         win = tk.Toplevel(self.root)
         win.title("Mesajı Düzenle")
-        win.geometry("500x160")
+        win.geometry("520x180")
         win.configure(bg=PANEL)
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
-        tk.Label(win, text="Yeni mesaj:", bg=PANEL, fg=MUTED,
-                 font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(16, 4))
+        tk.Frame(win, bg=self.theme_accent, height=3).pack(fill=tk.X)
+        tk.Label(win, text="✏️  Mesajı Düzenle", bg=PANEL, fg=TEXT,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=20, pady=(14, 6))
         entry = tk.Entry(win, bg=INPUT, fg=TEXT, insertbackground=TEXT,
                          bd=0, font=("Segoe UI", 12))
-        entry.pack(fill=tk.X, padx=20, ipady=9)
+        entry.pack(fill=tk.X, padx=20, ipady=10)
         entry.insert(0, item.text)
         entry.focus_set()
         entry.select_range(0, tk.END)
 
         def do_edit():
             new_text = entry.get().strip()
-            if not new_text:
+            if not new_text or new_text == item.text:
+                win.destroy()
                 return
-            item.text = new_text
+            item.text  = new_text
+            item.edited = True
             self._send_packet(self._build_packet(
                 "EDIT", {"ref_id": item.item_id, "new_text": new_text}))
             self._render_history(self.current_room)
@@ -1307,17 +1935,16 @@ class OPSIPro:
         btn_row = tk.Frame(win, bg=PANEL)
         btn_row.pack(fill=tk.X, padx=20, pady=12)
         tk.Button(btn_row, text="Kaydet", bg=ACCENT_S, fg="white",
-                  bd=0, font=("Segoe UI", 10, "bold"), padx=20, pady=7,
-                  cursor="hand2", activebackground=ACCENT, command=do_edit
+                  bd=0, font=("Segoe UI", 10, "bold"), padx=22, pady=7,
+                  cursor="hand2", activebackground=self.theme_accent, command=do_edit
                   ).pack(side=tk.RIGHT)
         tk.Button(btn_row, text="İptal", bg=PANEL_2, fg=MUTED,
-                  bd=0, font=("Segoe UI", 10), padx=16, pady=7,
+                  bd=0, font=("Segoe UI", 10), padx=18, pady=7,
                   cursor="hand2", command=win.destroy
                   ).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _edit_last_message(self, event=None):
-        """↑ tuşu ile son kendi mesajını düzenle"""
-        if not self.current_room or self.msg_entry.get():
+        if not self.current_room:
             return
         me = self.username_var.get().strip()
         for item in reversed(list(self.room_history[self.current_room])):
@@ -1326,11 +1953,41 @@ class OPSIPro:
                 self._edit_my_message()
                 return
 
+    # [İYİLEŞTİRME 3] Mesaj geçmişi navigasyonu
+    def _hist_prev(self, event=None):
+        if self.msg_entry.cget("state") == tk.DISABLED:
+            return
+        cur_text = self._get_entry_text()
+        if cur_text and self._sent_hist_idx == -1:
+            return "break"
+        if not self._sent_history:
+            return "break"
+        if self._sent_hist_idx == -1:
+            self._sent_hist_idx = len(self._sent_history) - 1
+        elif self._sent_hist_idx > 0:
+            self._sent_hist_idx -= 1
+        self._clear_entry()
+        self.msg_entry.insert("1.0", self._sent_history[self._sent_hist_idx])
+        return "break"
+
+    def _hist_next(self, event=None):
+        if self._sent_hist_idx == -1:
+            return "break"
+        if self._sent_hist_idx < len(self._sent_history) - 1:
+            self._sent_hist_idx += 1
+            self._clear_entry()
+            self.msg_entry.insert("1.0", self._sent_history[self._sent_hist_idx])
+        else:
+            self._sent_hist_idx = -1
+            self._clear_entry()
+        return "break"
+
     def _delete_my_message(self):
         item = self._get_ctx_item()
         if not item:
             return
-        if not messagebox.askyesno("Sil", "Bu mesaj silinsin mi?"):
+        if not messagebox.askyesno("Sil", "Bu mesaj kalıcı olarak silinsin mi?",
+                                   icon="warning"):
             return
         kept = deque(
             [x for x in self.room_history[self.current_room] if x.item_id != item.item_id],
@@ -1346,10 +2003,13 @@ class OPSIPro:
             return
         if item not in self.pinned_messages[self.current_room]:
             self.pinned_messages[self.current_room].append(item)
+            item.pinned = True
             self._system_message(f"📌 Mesaj sabitlendi.", GOLD)
         else:
             self.pinned_messages[self.current_room].remove(item)
+            item.pinned = False
             self._system_message("📌 Mesaj sabitlemesi kaldırıldı.", MUTED)
+        self._render_history(self.current_room)
 
     def _show_pinned(self):
         if not self.current_room:
@@ -1357,54 +2017,90 @@ class OPSIPro:
         pins = self.pinned_messages.get(self.current_room, [])
         win  = tk.Toplevel(self.root)
         win.title(f"#{self.current_room} — Sabitlenmiş Mesajlar")
-        win.geometry("440x360")
+        win.geometry("460x420")
         win.configure(bg=PANEL)
         win.attributes("-topmost", True)
 
+        tk.Frame(win, bg=GOLD, height=3).pack(fill=tk.X)
         tk.Label(win, text="📌  Sabitlenmiş Mesajlar", bg=PANEL, fg=TEXT,
-                 font=("Segoe UI", 12, "bold")).pack(padx=20, pady=(16, 8), anchor="w")
+                 font=("Segoe UI", 13, "bold")).pack(padx=20, pady=(18, 10), anchor="w")
 
         if not pins:
-            tk.Label(win, text="Sabitlenmiş mesaj yok.", bg=PANEL, fg=MUTED,
+            tk.Label(win, text="Bu kanalda sabitlenmiş mesaj yok.", bg=PANEL, fg=MUTED,
                      font=("Segoe UI", 10)).pack(pady=40)
+            tk.Button(win, text="Kapat", bg=PANEL_3, fg=MUTED, bd=0,
+                      font=("Segoe UI", 9), padx=16, pady=6, cursor="hand2",
+                      command=win.destroy).pack()
             return
 
-        for pin in pins:
-            pf = tk.Frame(win, bg=PANEL_2)
-            pf.pack(fill=tk.X, padx=16, pady=3)
-            tk.Label(pf, text=f"{pin.sender}: {pin.text[:80]}", bg=PANEL_2, fg=TEXT_2,
-                     font=("Segoe UI", 10), anchor="w", wraplength=380).pack(
-                padx=12, pady=8, anchor="w")
+        scroll_area = scrolledtext.ScrolledText(win, bg=PANEL, bd=0, state=tk.DISABLED,
+                                                 highlightthickness=0, wrap=tk.WORD,
+                                                 font=("Segoe UI", 10))
+        scroll_area.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+        scroll_area.config(state=tk.NORMAL)
+        for i, pin in enumerate(pins, 1):
+            ts = time.strftime("%d.%m %H:%M", time.localtime(pin.ts))
+            scroll_area.insert(tk.END, f"[{i}] {pin.sender}  ·  {ts}\n", "bold_tag")
+            scroll_area.insert(tk.END, f"    {pin.text[:200]}\n\n", "text_tag")
+        scroll_area.tag_configure("bold_tag", foreground=GOLD, font=("Segoe UI", 10, "bold"))
+        scroll_area.tag_configure("text_tag", foreground=TEXT_2)
+        scroll_area.config(state=tk.DISABLED)
 
-    def _reply_to_message(self):
+        tk.Button(win, text="Kapat", bg=PANEL_3, fg=MUTED, bd=0,
+                  font=("Segoe UI", 9), padx=16, pady=6, cursor="hand2",
+                  command=win.destroy).pack(pady=8)
+
+    # [İYİLEŞTİRME 17] Reply sistemi
+    def _set_reply_from_ctx(self):
         item = self._get_ctx_item()
         if not item:
             return
-        prefix = f"@{item.sender}: "
-        self.msg_entry.delete(0, tk.END)
-        self.msg_entry.insert(0, prefix)
+        self._set_reply(item)
+
+    def _set_reply(self, item: ChatItem):
+        self._reply_item = item
+        if not self._reply_bar_visible:
+            self.reply_bar.pack(fill=tk.X, before=self.typing_lbl)
+            self._reply_bar_visible = True
+        self.reply_sender_lbl.config(text=f"  ↩  {item.sender}'e yanıtlıyorsunuz")
+        preview = (item.text[:60] + "…") if len(item.text) > 60 else item.text
+        if item.kind == "IMG":
+            preview = "🖼️ Fotoğraf"
+        elif item.kind == "AUDIO":
+            preview = f"🎤 Ses mesajı ({item.audio_sec:.1f}s)"
+        elif item.kind == "FILE":
+            preview = f"📎 {item.file_name}"
+        self.reply_preview_lbl.config(text=f"  {preview}")
         self.msg_entry.focus_set()
-        self.msg_entry.icursor(tk.END)
+
+    def _cancel_reply(self):
+        self._reply_item = None
+        if self._reply_bar_visible:
+            self.reply_bar.pack_forget()
+            self._reply_bar_visible = False
+
+    def _reply_to_message(self):
+        item = self._get_ctx_item()
+        if item:
+            self._set_reply(item)
 
     def _add_reaction(self):
         item = self._get_ctx_item()
         if not item:
             return
-        # Basit tepki seçici
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg=PANEL_2)
-        quick = ["👍","👎","❤️","😂","😮","😢","🔥","🎉"]
         f = tk.Frame(win, bg=PANEL_2)
         f.pack(padx=8, pady=8)
-        for em in quick:
+        for em in QUICK_REACTIONS:
             lbl = tk.Label(f, text=em, bg=PANEL_2, font=("Segoe UI", 20), cursor="hand2")
-            lbl.pack(side=tk.LEFT, padx=4)
+            lbl.pack(side=tk.LEFT, padx=3)
             lbl.bind("<Enter>", lambda e, l=lbl: l.config(bg=HOVER))
             lbl.bind("<Leave>", lambda e, l=lbl: l.config(bg=PANEL_2))
             lbl.bind("<Button-1>", lambda e, em2=em: self._do_react(item, em2, win))
-        win.geometry(f"+{self.root.winfo_pointerx()-100}+{self.root.winfo_pointery()-60}")
+        win.geometry(f"+{self.root.winfo_pointerx()-80}+{self.root.winfo_pointery()-60}")
         win.bind("<FocusOut>", lambda e: win.destroy() if win.winfo_exists() else None)
         win.focus_set()
 
@@ -1416,8 +2112,14 @@ class OPSIPro:
             item.reactions[emoji].append(me)
         else:
             item.reactions[emoji].remove(me)
+            if not item.reactions[emoji]:
+                del item.reactions[emoji]
         win.destroy()
         self._render_history(self.current_room)
+        # Ağa gönder
+        self._send_packet(self._build_packet("REACT", {
+            "ref_id": item.item_id, "emoji": emoji, "user": me
+        }))
 
     def _copy_message_text(self):
         item = self._get_ctx_item()
@@ -1426,11 +2128,19 @@ class OPSIPro:
         self.root.clipboard_clear()
         self.root.clipboard_append(item.text)
 
+    # [İYİLEŞTİRME 24] Mesaj ID kopyalama
+    def _copy_msg_id(self):
+        item = self._get_ctx_item()
+        if not item:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(item.item_id)
+        self._system_message("📋 Mesaj ID kopyalandı.", MUTED)
+
     # ==================== YAZMA GÖSTERGESİ ====================
     def _on_typing(self, event=None):
-        text = self.msg_entry.get()
-        # Karakter sayacı
-        n = len(text)
+        text = self._get_entry_text()
+        n    = len(text)
         if n > 1800:
             self.char_count_lbl.config(text=f"{n}/2000", fg=DANGER)
         elif n > 1500:
@@ -1452,9 +2162,59 @@ class OPSIPro:
         if not typers:
             self.typing_var.set("")
         elif len(typers) == 1:
-            self.typing_var.set(f"  ✏  {typers[0]} yazıyor...")
+            self.typing_var.set(f"  ✏  {typers[0]} yazıyor…")
+        elif len(typers) <= 3:
+            self.typing_var.set(f"  ✏  {', '.join(typers)} yazıyor…")
         else:
-            self.typing_var.set(f"  ✏  {', '.join(typers)} yazıyor...")
+            self.typing_var.set(f"  ✏  {len(typers)} kişi yazıyor…")
+
+    # [İYİLEŞTİRME 22] @mention otomatik tamamlama
+    def _autocomplete_mention(self, event=None):
+        text = self._get_entry_text()
+        cursor_pos = self.msg_entry.index(tk.INSERT)
+        # @ sonrasındaki kelimeyi bul
+        before = self.msg_entry.get("1.0", tk.INSERT)
+        m = re.search(r'@(\w*)$', before)
+        if not m or not self.current_room:
+            return
+        prefix = m.group(1).lower()
+        users  = list(self.room_users.get(self.current_room, {}).keys())
+        me     = self.username_var.get().strip()
+        matches = [u for u in users if u.lower().startswith(prefix) and u != me]
+        if not matches:
+            return "break"
+        if len(matches) == 1:
+            start = f"insert-{len(m.group(1))}c"
+            self.msg_entry.delete(start, tk.INSERT)
+            self.msg_entry.insert(tk.INSERT, matches[0] + " ")
+        else:
+            # Popup
+            popup = tk.Toplevel(self.root)
+            popup.overrideredirect(True)
+            popup.attributes("-topmost", True)
+            popup.configure(bg=PANEL_2)
+            try:
+                x = self.msg_entry.winfo_rootx()
+                y = self.msg_entry.winfo_rooty() - len(matches) * 30 - 10
+            except Exception:
+                x, y = 400, 400
+            popup.geometry(f"200x{min(len(matches)*30+10, 180)}+{x}+{y}")
+            for match in matches[:6]:
+                lbl = tk.Label(popup, text=f"  @{match}", bg=PANEL_2, fg=TEXT,
+                               font=("Segoe UI", 10), cursor="hand2", anchor="w")
+                lbl.pack(fill=tk.X, pady=2)
+                lbl.bind("<Enter>", lambda e, l=lbl: l.config(bg=HOVER))
+                lbl.bind("<Leave>", lambda e, l=lbl: l.config(bg=PANEL_2))
+                def select(u=match, p=popup):
+                    start = f"insert-{len(m.group(1))}c"
+                    self.msg_entry.delete(start, tk.INSERT)
+                    self.msg_entry.insert(tk.INSERT, u + " ")
+                    p.destroy()
+                    self.msg_entry.focus_set()
+                lbl.bind("<Button-1>", lambda e, s=select: s())
+            popup.bind("<FocusOut>", lambda e: popup.destroy() if popup.winfo_exists() else None)
+            popup.focus_set()
+        return "break"
 
     # ==================== CHAT GÖSTERİMİ ====================
     def _clear_chat(self):
@@ -1474,11 +2234,15 @@ class OPSIPro:
         if not room:
             return
         self._clear_chat()
-        prev_ts = 0.0
+        prev_ts  = 0.0
+        prev_day = ""
         for item in self.room_history[room]:
-            # Gün ayraçı
-            if item.ts and (item.ts - prev_ts) > 3600:
-                self._insert_date_separator(item.ts)
+            # Gün ayraçı (daha akıllı)
+            if item.ts:
+                day_str = time.strftime("%Y-%m-%d", time.localtime(item.ts))
+                if day_str != prev_day:
+                    self._insert_date_separator(item.ts)
+                    prev_day = day_str
             prev_ts = item.ts or prev_ts
 
             if item.kind == "IMG":
@@ -1491,12 +2255,22 @@ class OPSIPro:
                 self._append_text_message(item)
 
         owner = self.room_owner.get(room, "bilinmiyor")
-        self.chat_subtitle.config(text=f"Kurucu: {owner}")
+        topic = self.room_topics.get(room, "")
+        display = topic if topic else f"Kurucu: {owner}"
+        self.chat_subtitle.config(text=display)
+        self._scroll_to_bottom()
 
     def _insert_date_separator(self, ts):
         self.chat_box.config(state=tk.NORMAL)
-        date_str = time.strftime("─── %d %B %Y ───", time.localtime(ts))
-        self.chat_box.insert(tk.END, f"\n  {date_str}\n\n", "date_sep")
+        now     = time.time()
+        diff    = now - ts
+        if diff < 86400:
+            date_str = "Bugün"
+        elif diff < 172800:
+            date_str = "Dün"
+        else:
+            date_str = time.strftime("%d %B %Y", time.localtime(ts))
+        self.chat_box.insert(tk.END, f"\n  ─── {date_str} ───\n\n", "date_sep")
         self.chat_box.config(state=tk.DISABLED)
 
     def _fmt_time(self, ts):
@@ -1509,7 +2283,7 @@ class OPSIPro:
     def _fmt_full_time(self, ts):
         if not ts:
             return ""
-        return time.strftime("%d.%m.%Y %H:%M", time.localtime(ts))
+        return time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(ts))
 
     def _name_tag(self, sender):
         me = self.username_var.get().strip()
@@ -1530,7 +2304,7 @@ class OPSIPro:
 
     def _insert_avatar_header(self, sender, ts):
         self.chat_box.insert(tk.END, "\n")
-        av = self._get_avatar_image(sender, 38 if not self.compact_mode else 24)
+        av = self._get_avatar_image(sender, 40 if not self.compact_mode else 24)
         self.avatar_refs.append(av)
         self.chat_box.image_create(tk.END, image=av, padx=10, pady=4)
         self.chat_box.insert(tk.END, " ")
@@ -1539,15 +2313,13 @@ class OPSIPro:
             self.chat_box.insert(tk.END, " 👑", "owner_badge")
         ts_str = self._fmt_time(ts)
         if ts_str:
-            self.chat_box.insert(tk.END, f"  {ts_str}\n", "time")
-        else:
-            self.chat_box.insert(tk.END, "\n")
+            self.chat_box.insert(tk.END, f"  {ts_str}", "time")
+        self.chat_box.insert(tk.END, "\n")
 
     def _tag_for_item(self, item_id):
         return f"item_{item_id}"
 
     def _auto_linkify(self, text):
-        """URL'leri vurgular, (text, is_link) tuple listesi döner"""
         url_re = re.compile(r'(https?://[^\s]+)')
         parts  = []
         last   = 0
@@ -1560,6 +2332,20 @@ class OPSIPro:
             parts.append((text[last:], False))
         return parts if parts else [(text, False)]
 
+    def _parse_inline_code(self, text):
+        """[İYİLEŞTİRME 18] `kod` sözdizimi ayrıştırma"""
+        parts = []
+        code_re = re.compile(r'`([^`]+)`')
+        last = 0
+        for m in code_re.finditer(text):
+            if m.start() > last:
+                parts.append((text[last:m.start()], "normal"))
+            parts.append((m.group(1), "code"))
+            last = m.end()
+        if last < len(text):
+            parts.append((text[last:], "normal"))
+        return parts if parts else [(text, "normal")]
+
     def _append_text_message(self, item: ChatItem):
         self.chat_box.config(state=tk.NORMAL)
         try:
@@ -1569,21 +2355,37 @@ class OPSIPro:
             if not grouped:
                 self._insert_avatar_header(item.sender, item.ts)
 
-            # @mention highlight
+            # [İYİLEŞTİRME 17] Reply quote
+            if item.reply_to and item.reply_sender:
+                self.chat_box.insert(tk.END, f"  ↩ {item.reply_sender}: {item.reply_text[:60]}\n",
+                                     ("reply_quote", tag))
+
             me       = self.username_var.get().strip()
             base_tag = "msg_cont" if grouped else "msg"
-            parts    = self._auto_linkify(item.text)
-            for part_text, is_link in parts:
-                if f"@{me}" in part_text:
-                    segs = part_text.split(f"@{me}")
-                    for i, seg in enumerate(segs):
-                        if seg:
-                            self.chat_box.insert(tk.END, seg, (base_tag, tag))
-                        if i < len(segs) - 1:
-                            self.chat_box.insert(tk.END, f"@{me}", ("mention", tag))
+
+            # [İYİLEŞTİRME 18] Inline code parse
+            inline_parts = self._parse_inline_code(item.text)
+            for part_text, part_type in inline_parts:
+                if part_type == "code":
+                    self.chat_box.insert(tk.END, part_text, ("code_inline", tag))
                 else:
-                    self.chat_box.insert(tk.END, part_text,
-                                         ("link" if is_link else base_tag, tag))
+                    url_parts = self._auto_linkify(part_text)
+                    for segment, is_link in url_parts:
+                        if f"@{me}" in segment:
+                            segs = segment.split(f"@{me}")
+                            for i, seg in enumerate(segs):
+                                if seg:
+                                    self.chat_box.insert(tk.END, seg, (base_tag, tag))
+                                if i < len(segs) - 1:
+                                    self.chat_box.insert(tk.END, f"@{me}", ("mention", tag))
+                        else:
+                            self.chat_box.insert(tk.END, segment,
+                                                 ("link" if is_link else base_tag, tag))
+
+            # Düzenlendi işareti
+            if item.edited:
+                self.chat_box.insert(tk.END, "  (düzenlendi)", ("msg_edited", tag))
+
             self.chat_box.insert(tk.END, "\n")
 
             # Tepkiler
@@ -1591,9 +2393,13 @@ class OPSIPro:
                 react_text = "  "
                 for em, users in item.reactions.items():
                     if users:
-                        react_text += f"  {em} {len(users)}"
+                        react_text += f" {em} {len(users)}"
                 if react_text.strip():
                     self.chat_box.insert(tk.END, react_text + "\n", "time")
+
+            # Sabitlendi işareti
+            if item.pinned:
+                self.chat_box.insert(tk.END, "  📌 sabitlendi\n", "pinned_mark")
 
             self._msg_line_map[item.item_id] = start_idx
             self._last_chat_sender = item.sender
@@ -1609,22 +2415,85 @@ class OPSIPro:
             if not grouped:
                 self._insert_avatar_header(item.sender, item.ts)
             tag = self._tag_for_item(item.item_id)
-            self.chat_box.insert(tk.END, f"{item.image_name}\n", ("msg", tag))
             try:
                 raw   = base64.b64decode(item.image_b64.encode("ascii"))
                 img   = Image.open(io.BytesIO(raw))
                 img.thumbnail((480, 360))
                 photo = ImageTk.PhotoImage(img)
                 self.image_refs.append(photo)
-                self.chat_box.image_create(tk.END, image=photo, padx=58, pady=4)
+                # Tıklanabilir resim (tam ekran)
+                img_lbl = tk.Label(self.chat_box, image=photo, bg=BG, cursor="hand2")
+                img_lbl.image = photo
+                img_lbl.bind("<Button-1>",
+                             lambda e, b=item.image_b64, n=item.image_name:
+                             self._show_image_fullscreen(b, n))
+                self.embed_refs.append(img_lbl)
+                self.chat_box.window_create(tk.END, window=img_lbl, padx=60, pady=4)
                 self.chat_box.insert(tk.END, "\n")
+                # Küçük bilgi
+                self.chat_box.insert(tk.END, f"  {item.image_name}\n", ("time", tag))
             except Exception:
-                self.chat_box.insert(tk.END, "[Fotoğraf gösterilemedi]\n", "warn")
+                self.chat_box.insert(tk.END, f"  [Fotoğraf: {item.image_name}]\n", "warn")
             self._last_chat_sender = item.sender
             self._last_chat_ts     = item.ts
             self.chat_box.see(tk.END)
         finally:
             self.chat_box.config(state=tk.DISABLED)
+
+    # [İYİLEŞTİRME 25] Tam ekran resim görüntüleyici
+    def _show_image_fullscreen(self, b64, name):
+        try:
+            raw = base64.b64decode(b64.encode("ascii"))
+            img = Image.open(io.BytesIO(raw))
+        except Exception:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"🖼️  {name}")
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        max_w, max_h = int(sw * 0.85), int(sh * 0.85)
+        win.geometry(f"{max_w}x{max_h}+{(sw-max_w)//2}+{(sh-max_h)//2}")
+        win.configure(bg=PANEL_3)
+        win.attributes("-topmost", True)
+
+        # Toolbar
+        tb = tk.Frame(win, bg=PANEL_3, height=44)
+        tb.pack(fill=tk.X)
+        tb.pack_propagate(False)
+        tk.Label(tb, text=f"  🖼️  {name}", bg=PANEL_3, fg=TEXT,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=12, pady=12)
+
+        def save_img():
+            path = filedialog.asksaveasfilename(initialfile=name,
+                filetypes=[("JPEG", "*.jpg"), ("PNG", "*.png"), ("Tümü", "*.*")])
+            if path:
+                img.save(path)
+                self._system_message(f"✅ Resim kaydedildi: {os.path.basename(path)}", SUCCESS)
+
+        tk.Button(tb, text="⬇ Kaydet", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2",
+                  activebackground=self.theme_accent, command=save_img).pack(side=tk.RIGHT, padx=8, pady=6)
+        close_b = tk.Label(tb, text="✕  Kapat", bg=PANEL_3, fg=MUTED,
+                           font=("Segoe UI", 9), cursor="hand2", padx=10)
+        close_b.pack(side=tk.RIGHT, pady=12)
+        self._hover(close_b, MUTED, TEXT)
+        close_b.bind("<Button-1>", lambda e: win.destroy())
+
+        canvas = tk.Canvas(win, bg=PANEL_3, highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        def render_image(event=None):
+            cw = canvas.winfo_width() or max_w
+            ch = canvas.winfo_height() or max_h - 44
+            display = img.copy()
+            display.thumbnail((cw, ch), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(display)
+            canvas._photo = photo
+            canvas.delete("all")
+            canvas.create_image(cw//2, ch//2, anchor="center", image=photo)
+
+        win.bind("<Configure>", render_image)
+        win.after(50, render_image)
+        win.bind("<Escape>", lambda e: win.destroy())
 
     def _append_audio_message(self, item: ChatItem):
         self.chat_box.config(state=tk.NORMAL)
@@ -1632,30 +2501,55 @@ class OPSIPro:
             grouped = self._should_group(item.sender, item.ts)
             if not grouped:
                 self._insert_avatar_header(item.sender, item.ts)
-            label = "🎵  Sesli mesaj"
-            if item.audio_sec:
-                label += f"  ({item.audio_sec:.1f} sn)"
-            self.chat_box.insert(tk.END, f"{label}\n", "audio")
+            tag = self._tag_for_item(item.item_id)
 
-            # Ses player widget
-            player_f = tk.Frame(self.chat_box, bg=PANEL_2, padx=8, pady=6)
+            # [İYİLEŞTİRME 26] Gelişmiş ses player widget
+            player_f = tk.Frame(self.chat_box, bg=PANEL_2, padx=10, pady=8)
+            waveform_lbl = tk.Label(player_f, text="▬▬▬▬▬▬▬▬▬▬▬▬",
+                                     bg=PANEL_2, fg=MUTED_2, font=("Segoe UI", 8))
+            waveform_lbl.pack(side=tk.LEFT, padx=(0, 8))
+
+            dur_str = f"{item.audio_sec:.1f}s" if item.audio_sec else ""
+            is_playing = [False]
+
+            def toggle_play(btn=None, it=item, wv=waveform_lbl):
+                if is_playing[0]:
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+                    is_playing[0] = False
+                    play_btn.config(text="  ▶  Dinle  ")
+                    wv.config(fg=MUTED_2)
+                else:
+                    is_playing[0] = True
+                    play_btn.config(text="  ■  Durdur  ")
+                    wv.config(fg=self.theme_accent)
+                    def worker():
+                        self._play_audio_worker(it)
+                        is_playing[0] = False
+                        try:
+                            play_btn.config(text="  ▶  Dinle  ")
+                            wv.config(fg=MUTED_2)
+                        except Exception:
+                            pass
+                    threading.Thread(target=worker, daemon=True).start()
+
             play_btn = tk.Button(
                 player_f, text="  ▶  Dinle  ",
                 bg=ACCENT_S, fg="white", bd=0,
-                activebackground=ACCENT, activeforeground="white",
-                font=("Segoe UI", 10), padx=12, pady=5, cursor="hand2",
-                command=lambda it=item, b=None: self._play_audio_item(it)
+                activebackground=self.theme_accent, activeforeground="white",
+                font=("Segoe UI", 10), padx=10, pady=5, cursor="hand2",
+                command=toggle_play
             )
             play_btn.pack(side=tk.LEFT)
-            duration_lbl = tk.Label(
-                player_f,
-                text=f"{item.audio_sec:.1f}s" if item.audio_sec else "",
-                bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9)
-            )
-            duration_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+            if dur_str:
+                tk.Label(player_f, text=f"  {dur_str}",
+                         bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=4)
 
             self.embed_refs.append(player_f)
-            self.chat_box.window_create(tk.END, window=player_f, padx=58, pady=2)
+            self.chat_box.window_create(tk.END, window=player_f, padx=62, pady=2)
             self.chat_box.insert(tk.END, "\n")
             self._last_chat_sender = item.sender
             self._last_chat_ts     = item.ts
@@ -1669,30 +2563,42 @@ class OPSIPro:
             grouped = self._should_group(item.sender, item.ts)
             if not grouped:
                 self._insert_avatar_header(item.sender, item.ts)
-            ext      = os.path.splitext(item.file_name)[1].lower()
-            ext_icon = {"pdf": "📄", "zip": "🗜️", "py": "🐍", "txt": "📝",
-                        "json": "📋", "csv": "📊", "html": "🌐"}.get(ext.lstrip("."), "📎")
-            size_kb  = item.file_size / 1024
-            label    = f"{ext_icon}  {item.file_name}  ({size_kb:.1f} KB)"
-            self.chat_box.insert(tk.END, f"{label}\n", "file")
+            tag      = self._tag_for_item(item.item_id)
+            ext      = os.path.splitext(item.file_name)[1].lower().lstrip(".")
+            ext_icon = FILE_ICONS.get(ext, "📎")
+            size_str = _fmt_filesize(item.file_size)
+            lang     = _detect_lang(item.file_name)
 
-            file_f = tk.Frame(self.chat_box, bg=PANEL_2, padx=8, pady=6)
-            dl_btn = tk.Button(
-                file_f, text="  ⬇  İndir  ",
+            file_f = tk.Frame(self.chat_box, bg=PANEL_2, padx=10, pady=8)
+            info_f = tk.Frame(file_f, bg=PANEL_2)
+            info_f.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tk.Label(info_f, text=f"{ext_icon}  {item.file_name}", bg=PANEL_2, fg=TEXT,
+                     font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(info_f, text=f"{size_str}  ·  {lang}", bg=PANEL_2, fg=MUTED,
+                     font=("Segoe UI", 8), anchor="w").pack(anchor="w")
+
+            btns = tk.Frame(file_f, bg=PANEL_2)
+            btns.pack(side=tk.RIGHT, padx=(12, 0))
+            tk.Button(
+                btns, text="⬇ İndir",
                 bg="#1e4d2b", fg="#3fb950", bd=0,
                 activebackground="#2a6b3c", activeforeground="white",
-                font=("Segoe UI", 10), padx=12, pady=5, cursor="hand2",
+                font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2",
                 command=lambda it=item: self._save_received_file(it)
-            )
-            dl_btn.pack(side=tk.LEFT)
-            size_lbl = tk.Label(
-                file_f, text=f"{size_kb:.1f} KB",
-                bg=PANEL_2, fg=MUTED, font=("Segoe UI", 9)
-            )
-            size_lbl.pack(side=tk.LEFT, padx=(8, 0))
+            ).pack(side=tk.LEFT, padx=2)
+
+            # [İYİLEŞTİRME 27] Metin dosyalarını önizle
+            if ext in ("txt", "py", "json", "csv", "md", "html", "xml", "js", "ts"):
+                tk.Button(
+                    btns, text="👁 Önizle",
+                    bg=PANEL_3, fg=MUTED, bd=0,
+                    activebackground=HOVER,
+                    font=("Segoe UI", 9), padx=10, pady=5, cursor="hand2",
+                    command=lambda it=item: self._preview_file(it)
+                ).pack(side=tk.LEFT, padx=2)
 
             self.embed_refs.append(file_f)
-            self.chat_box.window_create(tk.END, window=file_f, padx=58, pady=2)
+            self.chat_box.window_create(tk.END, window=file_f, padx=62, pady=2)
             self.chat_box.insert(tk.END, "\n")
             self._last_chat_sender = item.sender
             self._last_chat_ts     = item.ts
@@ -1700,12 +2606,44 @@ class OPSIPro:
         finally:
             self.chat_box.config(state=tk.DISABLED)
 
+    # [İYİLEŞTİRME 27] Dosya önizleme
+    def _preview_file(self, item: ChatItem):
+        try:
+            raw  = base64.b64decode(item.file_b64.encode("ascii"))
+            text = raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            messagebox.showerror("Önizleme Hatası", str(e))
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"👁️  {item.file_name}  —  Önizleme")
+        win.geometry("700x520")
+        win.configure(bg=PANEL)
+        win.attributes("-topmost", True)
+
+        tb = tk.Frame(win, bg=PANEL_3, height=44)
+        tb.pack(fill=tk.X)
+        tb.pack_propagate(False)
+        tk.Label(tb, text=f"  👁️  {item.file_name}  ({_fmt_filesize(item.file_size)})",
+                 bg=PANEL_3, fg=TEXT, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=12, pady=12)
+        tk.Button(tb, text="⬇ Kaydet", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2",
+                  activebackground=self.theme_accent,
+                  command=lambda: self._save_received_file(item)).pack(side=tk.RIGHT, padx=8, pady=6)
+
+        st = scrolledtext.ScrolledText(win, bg=PANEL_3, fg=TEXT_2,
+                                        font=("Courier New", 10), bd=0, wrap=tk.NONE,
+                                        highlightthickness=0)
+        st.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        st.insert("1.0", text[:50000])
+        st.config(state=tk.DISABLED)
+
     def _system_message(self, text: str, color: str = MUTED):
         self.chat_box.config(state=tk.NORMAL)
         try:
             tag_map = {MUTED: "sys", WARN: "warn", DANGER: "danger",
                        SUCCESS: "success_msg", GOLD: "warn", ACCENT: "sys",
-                       ACCENT_2: "success_msg"}
+                       ACCENT_2: "success_msg", self.theme_accent: "sys"}
             tag     = tag_map.get(color, "sys")
             self.chat_box.insert(tk.END, f"  —  {text}\n", tag)
             self.chat_box.tag_configure(tag, foreground=color)
@@ -1717,7 +2655,6 @@ class OPSIPro:
 
     # ==================== SIDEBAR GÜNCELLEME ====================
     def _refresh_member_list(self):
-        """Üye listesini filtrele ve güncelle"""
         q   = self.msg_search_var.get().strip().lower()
         self.users_list.delete(0, tk.END)
         if not self.current_room:
@@ -1735,21 +2672,24 @@ class OPSIPro:
             self.users_list.itemconfig(self.users_list.size()-1,
                 fg=MUTED_2, selectbackground=PANEL, selectforeground=MUTED_2)
             suffix = "  (Sen)" if owner == me else ""
-            self.users_list.insert(tk.END, f"  👑 {owner}{suffix}")
+            note   = " 📝" if owner in self.user_notes else ""
+            self.users_list.insert(tk.END, f"  👑 {owner}{suffix}{note}")
             self.users_list.itemconfig(self.users_list.size()-1, fg=GOLD, bg=PANEL)
 
-        others = sorted([u for u in users if u != owner], key=str.lower)
+        others   = sorted([u for u in users if u != owner], key=str.lower)
         filtered = [u for u in others if not q or q in u.lower()]
         if filtered:
             self.users_list.insert(tk.END, "  ÜYELER")
             self.users_list.itemconfig(self.users_list.size()-1,
                 fg=MUTED_2, selectbackground=PANEL, selectforeground=MUTED_2)
             for user in filtered:
-                online = (now - users[user]) < STALE_USER_SEC
+                ts_u   = users[user]
+                online = (now - ts_u) < STALE_USER_SEC
                 dot    = STATUS_ICONS["online"] if online else STATUS_ICONS["offline"]
                 color  = STATUS_COLORS["online"] if online else STATUS_COLORS["offline"]
                 suffix = "  (Sen)" if user == me else ""
-                self.users_list.insert(tk.END, f"  {dot} {user}{suffix}")
+                note   = " 📝" if user in self.user_notes else ""
+                self.users_list.insert(tk.END, f"  {dot} {user}{suffix}{note}")
                 self.users_list.itemconfig(self.users_list.size()-1,
                     fg=color if online else MUTED, bg=PANEL)
 
@@ -1764,14 +2704,20 @@ class OPSIPro:
             rooms = [r for r in rooms if filter_q in r.lower()]
 
         for room in rooms:
-            unread = self._unread_counts.get(room, 0)
-            badge  = f" ({unread})" if unread > 0 and room != self.current_room else ""
+            unread   = self._unread_counts.get(room, 0)
+            mentions = self._mention_counts.get(room, 0)
+            if mentions > 0 and room != self.current_room:
+                badge = f" (@{mentions})"
+            elif unread > 0 and room != self.current_room:
+                badge = f" ({unread})"
+            else:
+                badge = ""
             self.rooms_list.insert(tk.END, f"  # {room}{badge}")
             last = self.rooms_list.size() - 1
             if room == self.current_room:
                 self.rooms_list.itemconfig(last, fg=TEXT, bg=HOVER)
             else:
-                fg = WARN if unread > 0 else MUTED
+                fg = PINK if mentions > 0 else (WARN if unread > 0 else MUTED)
                 self.rooms_list.itemconfig(last, fg=fg, bg=PANEL_3)
 
         self._refresh_member_list()
@@ -1784,7 +2730,7 @@ class OPSIPro:
         if idx < 0 or idx >= self.rooms_list.size():
             return
         raw  = self.rooms_list.get(idx).strip()
-        room = re.sub(r'\s*\(\d+\)\s*$', '', raw.lstrip("#").strip())
+        room = re.sub(r'\s*[\(@][^)]*\)\s*$', '', raw.lstrip("#").strip())
         if room and room != self.current_room:
             self.join_room(room)
 
@@ -1800,6 +2746,7 @@ class OPSIPro:
                     text = text[len(prefix):].strip()
             if text.endswith("  (Sen)"):
                 text = text[:-7].strip()
+            text = text.replace(" 📝", "")
             return text if text not in ("KURUCU", "ÜYELER") else None
         except Exception:
             return None
@@ -1832,8 +2779,47 @@ class OPSIPro:
         if not user:
             return
         self.msg_entry.focus_set()
-        cur = self.msg_entry.get()
         self.msg_entry.insert(tk.END, f"@{user} ")
+
+    # [İYİLEŞTİRME 14] Kullanıcı notu ekleme
+    def _add_user_note(self):
+        user = self.selected_user or self._selected_user_from_list()
+        if not user:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"{user} — Not")
+        win.geometry("400x200")
+        win.configure(bg=PANEL)
+        win.attributes("-topmost", True)
+
+        tk.Label(win, text=f"📝  {user} için not:", bg=PANEL, fg=MUTED,
+                 font=("Segoe UI", 10)).pack(anchor="w", padx=20, pady=(16, 4))
+        txt = tk.Text(win, bg=INPUT, fg=TEXT, insertbackground=TEXT,
+                      bd=0, font=("Segoe UI", 10), height=4, wrap=tk.WORD)
+        txt.pack(fill=tk.X, padx=20, pady=(0, 8))
+        existing = self.user_notes.get(user, "")
+        txt.insert("1.0", existing)
+        txt.focus_set()
+
+        def save():
+            note = txt.get("1.0", tk.END).strip()
+            if note:
+                self.user_notes[user] = note
+            else:
+                self.user_notes.pop(user, None)
+            self._save_config()
+            win.destroy()
+            self._refresh_member_list()
+
+        btn_row = tk.Frame(win, bg=PANEL)
+        btn_row.pack(fill=tk.X, padx=20, pady=4)
+        tk.Button(btn_row, text="Kaydet", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 10, "bold"), padx=18, pady=6,
+                  cursor="hand2", activebackground=self.theme_accent, command=save
+                  ).pack(side=tk.RIGHT)
+        tk.Button(btn_row, text="İptal", bg=PANEL_2, fg=MUTED,
+                  bd=0, font=("Segoe UI", 10), padx=14, pady=6,
+                  cursor="hand2", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 8))
 
     def _show_selected_user_info(self):
         user = self.selected_user or self._selected_user_from_list()
@@ -1846,40 +2832,58 @@ class OPSIPro:
 
         win = tk.Toplevel(self.root)
         win.title(f"{user} — Profil")
-        win.geometry("340x300")
+        win.geometry("360x380")
         win.configure(bg=PANEL)
         win.resizable(False, False)
         win.attributes("-topmost", True)
 
-        # Avatar
-        av  = self._get_avatar_image(user, 64)
+        tk.Frame(win, bg=self.theme_accent, height=3).pack(fill=tk.X)
+
+        av  = self._get_avatar_image(user, 72)
         self.avatar_refs.append(av)
         av_lbl = tk.Label(win, image=av, bg=PANEL)
         av_lbl.image = av
         av_lbl.pack(pady=(24, 8))
 
         tk.Label(win, text=user, bg=PANEL, fg=TEXT,
-                 font=("Segoe UI", 14, "bold")).pack()
+                 font=("Segoe UI", 15, "bold")).pack()
         if is_owner:
-            tk.Label(win, text="👑 Oda kurucusu", bg=PANEL, fg=GOLD,
-                     font=("Segoe UI", 9)).pack()
-        status_txt  = "🟢 Çevrimiçi" if online else "⚫ Çevrimdışı"
-        status_col  = SUCCESS if online else MUTED
+            tk.Label(win, text="👑 Oda Kurucusu", bg=PANEL, fg=GOLD,
+                     font=("Segoe UI", 9)).pack(pady=2)
+        status_txt = "🟢 Çevrimiçi" if online else "⚫ Çevrimdışı"
+        status_col = SUCCESS if online else MUTED
         tk.Label(win, text=status_txt, bg=PANEL, fg=status_col,
-                 font=("Segoe UI", 10)).pack(pady=4)
+                 font=("Segoe UI", 10)).pack(pady=2)
+
+        # Kullanıcı notu varsa göster
+        note = self.user_notes.get(user)
+        if note:
+            note_f = tk.Frame(win, bg=PANEL_2)
+            note_f.pack(fill=tk.X, padx=24, pady=6)
+            tk.Label(note_f, text=f"📝  {note[:80]}", bg=PANEL_2, fg=MUTED,
+                     font=("Segoe UI", 9, "italic"), anchor="w", wraplength=280).pack(
+                fill=tk.X, padx=10, pady=6)
 
         info_f = tk.Frame(win, bg=PANEL_2)
-        info_f.pack(fill=tk.X, padx=24, pady=12)
-        tk.Label(info_f, text=f"  Mesaj sayısı:  {len(msgs)}", bg=PANEL_2, fg=TEXT_2,
-                 font=("Segoe UI", 10), anchor="w").pack(fill=tk.X, pady=6)
+        info_f.pack(fill=tk.X, padx=24, pady=6)
+        msg_count  = len([m for m in msgs if m.kind == "MSG"])
+        img_count  = len([m for m in msgs if m.kind == "IMG"])
+        tk.Label(info_f, text=f"  💬 {msg_count} mesaj  ·  🖼️ {img_count} fotoğraf",
+                 bg=PANEL_2, fg=TEXT_2, font=("Segoe UI", 10), anchor="w").pack(fill=tk.X, pady=6)
         if last_seen:
-            ts_str = time.strftime("%H:%M:%S", time.localtime(last_seen))
-            tk.Label(info_f, text=f"  Son görülme:  {ts_str}", bg=PANEL_2, fg=MUTED,
+            ts_str = time.strftime("%d.%m.%Y %H:%M", time.localtime(last_seen))
+            tk.Label(info_f, text=f"  🕐 Son görülme: {ts_str}", bg=PANEL_2, fg=MUTED,
                      font=("Segoe UI", 9), anchor="w").pack(fill=tk.X, pady=(0, 6))
 
-        tk.Button(win, text="Kapat", bg=PANEL_3, fg=MUTED,
-                  bd=0, font=("Segoe UI", 9), padx=16, pady=6,
-                  cursor="hand2", command=win.destroy).pack(pady=8)
+        btn_row = tk.Frame(win, bg=PANEL)
+        btn_row.pack(pady=10)
+        tk.Button(btn_row, text="💬 Bahset", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 9), padx=14, pady=6, cursor="hand2",
+                  activebackground=self.theme_accent,
+                  command=lambda: (self._mention_user(), win.destroy())).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="Kapat", bg=PANEL_3, fg=MUTED,
+                  bd=0, font=("Segoe UI", 9), padx=14, pady=6,
+                  cursor="hand2", command=win.destroy).pack(side=tk.LEFT, padx=4)
 
     def _ban_user(self, user):
         if not user or not self.current_room or user == self.username_var.get().strip():
@@ -1895,7 +2899,8 @@ class OPSIPro:
 
     def _ban_selected_user_cmd(self):
         user = self.selected_user or self._selected_user_from_list()
-        if user and messagebox.askyesno("Banla", f"{user} odadan banlansın mı?"):
+        if user and messagebox.askyesno("Banla", f"⚠️  {user} bu odadan banlansın mı?",
+                                        icon="warning"):
             self._ban_user(user)
 
     def _purge_user_messages_cmd(self, user):
@@ -1910,7 +2915,7 @@ class OPSIPro:
 
     def _purge_selected_user_messages(self):
         user = self.selected_user or self._selected_user_from_list()
-        if user and messagebox.askyesno("Temizle", f"{user} mesajları silinsin mi?"):
+        if user and messagebox.askyesno("Temizle", f"{user} tüm mesajları silinsin mi?"):
             self._purge_user_messages_cmd(user)
 
     def _copy_selected_user_name(self):
@@ -1924,6 +2929,8 @@ class OPSIPro:
             return
         if not self._is_owner(self.current_room):
             messagebox.showwarning("Yetki yok", "Oda kurucusu olmalısın.")
+            return
+        if not messagebox.askyesno("Temizle", "Tüm sohbet geçmişi silinsin mi?", icon="warning"):
             return
         self.room_history[self.current_room].clear()
         self._clear_chat()
@@ -1950,6 +2957,81 @@ class OPSIPro:
         self._refresh_sidebar()
         self._update_typing_indicator(self.current_room)
         self.root.after(UI_REFRESH_MS, self._tick_ui)
+
+    # [İYİLEŞTİRME 28] Hızlı oda değiştirici (Ctrl+K)
+    def _quick_room_switcher(self):
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=PANEL_2)
+        w, h = 380, 320
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.geometry(f"{w}x{h}+{(sw-w)//2}+{sh//4}")
+
+        tk.Label(win, text="  ⚡  Kanala hızlı geç  (Ctrl+K)",
+                 bg=PANEL_2, fg=MUTED_2, font=("Segoe UI", 9)).pack(fill=tk.X, padx=10, pady=6)
+
+        search_f = tk.Frame(win, bg=INPUT)
+        search_f.pack(fill=tk.X, padx=10)
+        entry_var = tk.StringVar()
+        entry = tk.Entry(search_f, textvariable=entry_var, bg=INPUT, fg=TEXT,
+                         insertbackground=TEXT, bd=0, font=("Segoe UI", 13), relief=tk.FLAT)
+        entry.pack(fill=tk.X, padx=8, ipady=12)
+        entry.focus_set()
+
+        lb = tk.Listbox(win, bg=PANEL_2, fg=TEXT, bd=0, highlightthickness=0,
+                        selectbackground="#1f3050", selectforeground=TEXT,
+                        activestyle="none", font=("Segoe UI", 11), relief=tk.FLAT)
+        lb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        tk.Label(win, text="  Enter: Geç  ·  Esc: Kapat",
+                 bg=PANEL_2, fg=MUTED_2, font=("Segoe UI", 8)).pack(fill=tk.X, padx=10, pady=4)
+
+        def populate(q=""):
+            lb.delete(0, tk.END)
+            now   = time.time()
+            rooms = sorted([r for r, t in self.known_rooms.items()
+                            if now - t <= STALE_ROOM_SEC], key=str.lower)
+            for r in rooms:
+                if not q or q.lower() in r.lower():
+                    prefix = "● " if r == self.current_room else "  "
+                    lb.insert(tk.END, f"{prefix}# {r}")
+            if lb.size() > 0:
+                lb.selection_set(0)
+
+        populate()
+        entry_var.trace_add("write", lambda *a: populate(entry_var.get()))
+
+        def go(event=None):
+            sel = lb.curselection()
+            if not sel:
+                q = entry_var.get().strip()
+                if q:
+                    win.destroy()
+                    self.join_room(q)
+                return
+            raw  = lb.get(sel[0]).strip()
+            room = re.sub(r'^[●\s#]+', '', raw).strip()
+            if room:
+                win.destroy()
+                self.join_room(room)
+
+        def nav(event):
+            sel = lb.curselection()
+            cur = sel[0] if sel else -1
+            if event.keysym == "Down" and cur < lb.size() - 1:
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(cur + 1)
+            elif event.keysym == "Up" and cur > 0:
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(cur - 1)
+
+        entry.bind("<Return>", go)
+        entry.bind("<Escape>", lambda e: win.destroy())
+        entry.bind("<Down>",   nav)
+        entry.bind("<Up>",     nav)
+        lb.bind("<ButtonRelease-1>", go)
+        win.bind("<FocusOut>", lambda e: win.destroy() if win.winfo_exists() else None)
 
     # ==================== ODA YÖNETİMİ ====================
     def _fix_username(self, base_name: str, room: str) -> str:
@@ -1994,10 +3076,11 @@ class OPSIPro:
         self.current_room = room_name
         self.status_var.set(f"#{room_name}")
         self.chat_title.config(text=room_name)
-        self.chat_subtitle.config(text="Geçmiş yükleniyor...")
+        self.chat_subtitle.config(text="Geçmiş yükleniyor…")
         self._toggle_inputs(True)
         self.msg_entry.focus_set()
-        self._unread_counts[room_name] = 0
+        self._unread_counts[room_name]  = 0
+        self._mention_counts[room_name] = 0
 
         now = time.time()
         self.known_rooms[room_name]               = now
@@ -2007,7 +3090,7 @@ class OPSIPro:
         self._recalculate_room_owner(room_name)
         self._clear_chat()
         self._render_history(room_name)
-        self._system_message(f"#{room_name} kanalına katıldınız.", SUCCESS)
+        self._system_message(f"#{room_name} kanalına katıldınız. 👋", SUCCESS)
         self._send_packet(self._build_packet("JOIN", {"room": room_name}))
         self._send_packet(self._build_packet("HISTORY_REQ", {"need": True}, target=username))
         self._refresh_sidebar()
@@ -2024,6 +3107,7 @@ class OPSIPro:
             return
         old = self.current_room
         self._stop_screen_share(silent=True)
+        self._cancel_reply()
         self._send_packet(self._build_packet("PART", {"reason": "leave"}, room=old))
         self.current_room = ""
         self.status_var.set("Bağlı değil")
@@ -2031,7 +3115,7 @@ class OPSIPro:
         self.chat_subtitle.config(text="Bir kanala katılın")
         self.screen_status_var.set("")
         self._set_screen_preview(None, sender=None)
-        self.msg_entry.delete(0, tk.END)
+        self._clear_entry()
         self._toggle_inputs(False)
         self._clear_chat()
         self._system_message(f"#{old} kanalından ayrıldınız.", WARN)
@@ -2039,36 +3123,68 @@ class OPSIPro:
 
     # ==================== MESAJ GÖNDER ====================
     def send_message(self):
-        text = self.msg_entry.get().strip()
+        text = self._get_entry_text().strip()
         if not text or not self.current_room:
             return
-        if len(text) > 2000:
-            messagebox.showwarning("Çok uzun", "Mesaj 2000 karakterden uzun olamaz.")
+        if len(text) > MAX_MSG_LEN:
+            messagebox.showwarning("Çok uzun", f"Mesaj {MAX_MSG_LEN} karakterden uzun olamaz.")
             return
         if text.startswith("/"):
             self._handle_commands(text)
-            self.msg_entry.delete(0, tk.END)
+            self._clear_entry()
             return
+
+        # Geçmişe ekle
+        if not self._sent_history or self._sent_history[-1] != text:
+            self._sent_history.append(text)
+            if len(self._sent_history) > 50:
+                self._sent_history.pop(0)
+        self._sent_hist_idx = -1
+
         user      = self.username_var.get().strip() or "Anon"
         packet_id = str(uuid.uuid4())
         self.seen_packet_ids.add(packet_id)
+
+        # Reply bilgisi
+        reply_to = reply_sender = reply_text = ""
+        if self._reply_item:
+            reply_to     = self._reply_item.item_id
+            reply_sender = self._reply_item.sender
+            if self._reply_item.kind == "MSG":
+                reply_text = self._reply_item.text[:60]
+            elif self._reply_item.kind == "IMG":
+                reply_text = "🖼️ Fotoğraf"
+            elif self._reply_item.kind == "AUDIO":
+                reply_text = "🎤 Ses mesajı"
+            elif self._reply_item.kind == "FILE":
+                reply_text = f"📎 {self._reply_item.file_name}"
+
         item = ChatItem(item_id=packet_id, kind="MSG", sender=user,
-                        ts=time.time(), room=self.current_room, text=text)
+                        ts=time.time(), room=self.current_room, text=text,
+                        reply_to=reply_to, reply_sender=reply_sender, reply_text=reply_text)
         self.room_history[self.current_room].append(item)
         self._append_text_message(item)
-        self._send_packet(self._build_packet("MSG", {"text": text}, packet_id=packet_id))
-        self.msg_entry.delete(0, tk.END)
+        pkt_data = {"text": text}
+        if reply_to:
+            pkt_data.update({"reply_to": reply_to, "reply_sender": reply_sender,
+                              "reply_text": reply_text})
+        self._send_packet(self._build_packet("MSG", pkt_data, packet_id=packet_id))
+        self._clear_entry()
         self.char_count_lbl.config(text="")
+        self._cancel_reply()
+        self._stats["sent"] += 1
 
     def _handle_commands(self, text):
         parts  = text.split(" ", 1)
         cmd    = parts[0].lower()
         target = parts[1].strip() if len(parts) > 1 else ""
         cmds = {
-            "/leave":  self.leave_room,
-            "/clear":  self.clear_room_history,
-            "/screen": self._toggle_screen_share,
-            "/help":   self._show_help,
+            "/leave":   self.leave_room,
+            "/clear":   self.clear_room_history,
+            "/screen":  self._toggle_screen_share,
+            "/help":    self._show_help,
+            "/stats":   self._show_stats_window,
+            "/rooms":   self._show_all_rooms,
         }
         if cmd in cmds:
             cmds[cmd]()
@@ -2077,9 +3193,11 @@ class OPSIPro:
         elif cmd == "/purge" and target:
             self._purge_user_messages_cmd(target)
         elif cmd == "/nick" and target:
+            old = self.username_var.get().strip()
             self.username_var.set(target)
-            self.user_name_lbl.config(text=target)
-            self._system_message(f"Kullanıcı adın '{target}' olarak değiştirildi.", SUCCESS)
+            if hasattr(self, "user_name_lbl"):
+                self.user_name_lbl.config(text=target)
+            self._system_message(f"✅ Kullanıcı adın '{target}' olarak değiştirildi.", SUCCESS)
         elif cmd == "/me" and target:
             user      = self.username_var.get().strip()
             packet_id = str(uuid.uuid4())
@@ -2090,26 +3208,60 @@ class OPSIPro:
             self.room_history[self.current_room].append(item)
             self._append_text_message(item)
             self._send_packet(self._build_packet("MSG", {"text": text2}, packet_id=packet_id))
+        elif cmd == "/topic" and target:
+            if self._is_owner(self.current_room):
+                self.room_topics[self.current_room] = target
+                self.chat_subtitle.config(text=target)
+                self._system_message(f"📝 Kanal konusu: {target}", ACCENT)
+            else:
+                self._system_message("Kanal konusunu yalnız kurucu değiştirebilir.", WARN)
+        elif cmd == "/shrug":
+            text2 = "¯\\_(ツ)_/¯"
+            self.msg_entry.delete("1.0", tk.END)
+            self.msg_entry.insert("1.0", text2)
         else:
-            self._system_message(f"Bilinmeyen komut: {cmd}  —  /help yazın", WARN)
+            self._system_message(f"❌ Bilinmeyen komut: {cmd}  —  /help ile komutları görün", WARN)
+            self._play_error_sound()
 
     def _show_help(self):
         help_text = (
             "📖 Komut listesi:\n"
-            "  /leave       — Kanaldan ayrıl\n"
-            "  /clear       — Geçmişi temizle (kurucu)\n"
-            "  /screen      — Ekran paylaşımını aç/kapat\n"
-            "  /ban <kişi>  — Banla (kurucu)\n"
-            "  /purge <kişi>— Mesajları sil (kurucu)\n"
-            "  /nick <ad>   — Kullanıcı adını değiştir\n"
-            "  /me <eylem>  — Eylem mesajı gönder\n"
-            "  ↑ tuşu      — Son mesajı düzenle\n"
-            "  Ctrl+F      — Mesajlarda ara"
+            "  /leave         — Kanaldan ayrıl\n"
+            "  /clear         — Geçmişi temizle (kurucu)\n"
+            "  /screen        — Ekran paylaşımını aç/kapat\n"
+            "  /ban <kişi>    — Banla (kurucu)\n"
+            "  /purge <kişi>  — Mesajlarını sil (kurucu)\n"
+            "  /nick <ad>     — Kullanıcı adını değiştir\n"
+            "  /me <eylem>    — Eylem mesajı gönder\n"
+            "  /topic <metin> — Kanal konusu ayarla (kurucu)\n"
+            "  /shrug         — ¯\\_(ツ)_/¯\n"
+            "  /stats         — İstatistikleri göster\n"
+            "  /rooms         — Tüm odaları göster\n\n"
+            "⌨️  Kısayollar:\n"
+            "  ↑ / ↓          — Mesaj geçmişi\n"
+            "  Ctrl+F         — Mesajlarda ara\n"
+            "  Ctrl+K         — Hızlı oda değiştir\n"
+            "  Ctrl+,         — Ayarlar\n"
+            "  Tab            — @mention tamamla\n"
+            "  Shift+Enter    — Yeni satır"
         )
         self._system_message(help_text, ACCENT)
 
-    def _send_gif_placeholder(self):
-        self._system_message("GIF desteği yakında!", MUTED)
+    # [İYİLEŞTİRME 29] Tüm odaları göster
+    def _show_all_rooms(self):
+        now   = time.time()
+        rooms = sorted([r for r, t in self.known_rooms.items()
+                        if now - t <= STALE_ROOM_SEC], key=str.lower)
+        if not rooms:
+            self._system_message("Bilinen oda yok.", MUTED)
+            return
+        lines = ["📋 Bilinen odalar:"]
+        for r in rooms:
+            user_count = len([u for u, t in self.room_users.get(r, {}).items()
+                               if now - t < STALE_USER_SEC])
+            marker = " ← (şu an)" if r == self.current_room else ""
+            lines.append(f"  # {r}  ({user_count} üye){marker}")
+        self._system_message("\n".join(lines), ACCENT)
 
     # ==================== GÖRÜNTÜ ====================
     def send_image(self):
@@ -2124,7 +3276,7 @@ class OPSIPro:
             payload = self._prepare_image(Image.open(path).convert("RGB"), os.path.basename(path))
             self._dispatch_image_payload(payload)
         except Exception as exc:
-            messagebox.showerror("Resim Hatası", f"Fotoğraf hazırlanamadı: {exc}")
+            messagebox.showerror("Resim Hatası", f"Fotoğraf hazırlanamadı:\n{exc}")
 
     def _paste_image(self, event=None):
         if not self.current_room:
@@ -2134,7 +3286,7 @@ class OPSIPro:
             if isinstance(img, Image.Image):
                 payload = self._prepare_image(img.convert("RGB"), f"Pano_{int(time.time())}.jpg")
                 self._dispatch_image_payload(payload)
-                self._system_message("Panodaki resim gönderildi.", SUCCESS)
+                self._system_message("📋 Panodaki resim gönderildi.", SUCCESS)
         except Exception:
             pass
 
@@ -2153,7 +3305,7 @@ class OPSIPro:
 
     def _dispatch_image_payload(self, payload):
         if len(payload["b64"]) > MAX_IMAGE_B64_LEN:
-            messagebox.showwarning("Boyut", "Fotoğraf çok büyük.")
+            messagebox.showwarning("Boyut", "Fotoğraf çok büyük, sıkıştırılamadı.")
             return
         user      = self.username_var.get().strip() or "Anon"
         packet_id = str(uuid.uuid4())
@@ -2164,6 +3316,7 @@ class OPSIPro:
         self.room_history[self.current_room].append(item)
         self._append_image_message(item)
         self._send_packet(self._build_packet("IMG", payload, packet_id=packet_id))
+        self._stats["sent"] += 1
 
     # ==================== DOSYA GÖNDER ====================
     def send_file(self):
@@ -2171,7 +3324,7 @@ class OPSIPro:
             return
         path = filedialog.askopenfilename(
             title="Dosya seç",
-            filetypes=[("Desteklenen", "*.txt *.pdf *.zip *.json *.csv *.py *.html *.xml *.md *.docx"),
+            filetypes=[("Desteklenen", "*.txt *.pdf *.zip *.json *.csv *.py *.html *.xml *.md *.docx *.xlsx *.js *.ts *.sh"),
                        ("Tümü", "*.*")])
         if not path:
             return
@@ -2191,12 +3344,8 @@ class OPSIPro:
             for idx in range(total):
                 chunk = b64[idx * FILE_CHUNK_SIZE:(idx + 1) * FILE_CHUNK_SIZE]
                 self._send_packet(self._build_packet("FILE_CHUNK", {
-                    "file_id": packet_id,
-                    "name":    fname,
-                    "size":    len(file_bytes),
-                    "index":   idx,
-                    "total":   total,
-                    "chunk":   chunk,
+                    "file_id": packet_id, "name": fname, "size": len(file_bytes),
+                    "index": idx, "total": total, "chunk": chunk,
                 }, packet_id=str(uuid.uuid4())))
 
             item = ChatItem(item_id=packet_id, kind="FILE", sender=user,
@@ -2204,20 +3353,24 @@ class OPSIPro:
                             file_b64=b64, file_name=fname, file_size=len(file_bytes))
             self.room_history[self.current_room].append(item)
             self._append_file_message(item)
+            self._system_message(f"📎 {fname} gönderildi ({_fmt_filesize(len(file_bytes))}).", SUCCESS)
+            self._stats["sent"] += 1
         except Exception as exc:
-            messagebox.showerror("Dosya Hatası", f"Gönderilemedi: {exc}")
+            messagebox.showerror("Dosya Hatası", f"Gönderilemedi:\n{exc}")
 
     def _save_received_file(self, item: ChatItem):
-        path = filedialog.asksaveasfilename(initialfile=item.file_name)
+        path = filedialog.asksaveasfilename(
+            initialfile=item.file_name,
+            filetypes=[("Tümü", "*.*")])
         if not path:
             return
         try:
             raw = base64.b64decode(item.file_b64.encode("ascii"))
             with open(path, "wb") as f:
                 f.write(raw)
-            self._system_message(f"✅ Dosya kaydedildi: {os.path.basename(path)}", SUCCESS)
+            self._system_message(f"✅ {os.path.basename(path)} kaydedildi.", SUCCESS)
         except Exception as exc:
-            messagebox.showerror("Kayıt Hatası", f"{exc}")
+            messagebox.showerror("Kayıt Hatası", str(exc))
 
     # ==================== SES ====================
     def _start_audio_record(self, event=None):
@@ -2232,7 +3385,7 @@ class OPSIPro:
             self.is_recording    = True
             self.audio_frames    = []
             self.record_start_ts = time.time()
-            self.audio_status_var.set("🔴  Kayıt devam ediyor… (maks 30 sn)")
+            self.audio_status_var.set("🔴  Kayıt devam ediyor… (maks 30 sn, bırak = gönder)")
             self.mic_btn.config(fg=DANGER)
             self.audio_timer = self.root.after(30000, self._stop_audio_record)
             def callback(indata, frames, time_info, status):
@@ -2271,7 +3424,7 @@ class OPSIPro:
             duration = len(audio) / AUDIO_SR
             if duration < AUDIO_MIN_SEC:
                 self.audio_status_var.set("Kayıt çok kısa")
-                self.root.after(1200, lambda: self.audio_status_var.set(""))
+                self.root.after(1500, lambda: self.audio_status_var.set(""))
                 return
             raw        = audio.tobytes()
             compressed = zlib.compress(raw, level=9)
@@ -2299,8 +3452,9 @@ class OPSIPro:
             self.room_history[self.current_room].append(item)
             self._append_audio_message(item)
             self.sock.sendto(raw_p, (BROADCAST_ADDR, PORT))
-            self.audio_status_var.set("✓  Ses gönderildi")
-            self.root.after(1500, lambda: self.audio_status_var.set(""))
+            self.audio_status_var.set(f"✓  {duration:.1f}s ses gönderildi")
+            self.root.after(2000, lambda: self.audio_status_var.set(""))
+            self._stats["sent"] += 1
         except Exception as exc:
             messagebox.showerror("Ses işleme hatası", f"Gönderilemedi:\n{exc}")
             self.audio_status_var.set("")
@@ -2319,7 +3473,7 @@ class OPSIPro:
                 raw = zlib.decompress(raw)
             audio = np.frombuffer(raw, dtype=np.int16)
             if audio.size == 0:
-                raise ValueError("Boş ses")
+                raise ValueError("Boş ses verisi")
             sd.stop()
             sd.play(audio, samplerate=item.audio_sr or AUDIO_SR)
             sd.wait()
@@ -2342,13 +3496,14 @@ class OPSIPro:
         if (getattr(self, "current_screen_sender", None) and
                 self.current_screen_sender != self.username_var.get().strip() and
                 time.time() - getattr(self, "last_screen_ts", 0) < 4.0):
-            messagebox.showwarning("Uyarı", f"{self.current_screen_sender} paylaşıyor.")
-            return
+            if not messagebox.askyesno("Uyarı",
+                f"{self.current_screen_sender} zaten paylaşıyor.\nYine de başlatmak istiyor musun?"):
+                return
         self.screen_sharing = True
         self.screen_status_var.set("🔴  Ekran paylaşılıyor")
         if hasattr(self, "screen_icon"):
             self.screen_icon.config(text="🔴", fg=DANGER)
-        self._system_message("Ekran paylaşımı başlatıldı.", SUCCESS)
+        self._system_message("🖥️ Ekran paylaşımı başlatıldı.", SUCCESS)
         self.screen_thread = threading.Thread(target=self._screen_share_loop, daemon=True)
         self.screen_thread.start()
 
@@ -2362,7 +3517,7 @@ class OPSIPro:
         if hasattr(self, "screen_icon"):
             self.screen_icon.config(text="🖥️", fg=MUTED)
         if not silent:
-            self._system_message("Ekran paylaşımı durduruldu.", WARN)
+            self._system_message("🖥️ Ekran paylaşımı durduruldu.", WARN)
 
     def _screen_share_loop(self):
         try:
@@ -2389,8 +3544,7 @@ class OPSIPro:
                     smaller.thumbnail((max(480, SCREEN_SHARE_MAX_SIDE // 2),
                                        max(270, SCREEN_SHARE_MAX_SIDE // 2)), rf)
                     buf = io.BytesIO()
-                    smaller.save(buf, format="JPEG",
-                                 quality=max(18, SCREEN_SHARE_JPEG_Q - 10))
+                    smaller.save(buf, format="JPEG", quality=max(18, SCREEN_SHARE_JPEG_Q - 10))
                     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                 if len(b64) > SCREEN_SHARE_MAX_B64:
                     time.sleep(SCREEN_SHARE_INTERVAL)
@@ -2410,7 +3564,7 @@ class OPSIPro:
                         self.sock.sendto(raw_p, (BROADCAST_ADDR, PORT))
                 time.sleep(SCREEN_SHARE_INTERVAL)
             except Exception as exc:
-                self.root.after(0, lambda: self.screen_status_var.set(f"Hata: {exc}"))
+                self.root.after(0, lambda: self.screen_status_var.set(f"Ekran hatası"))
                 time.sleep(SCREEN_SHARE_INTERVAL)
 
     def _handle_screen_packet(self, pkt, room, sender, data):
@@ -2469,12 +3623,16 @@ class OPSIPro:
             self.viewer_window.geometry("1100x720")
             self.viewer_window.configure(bg=BG)
 
-            # Toolbar
-            toolbar = tk.Frame(self.viewer_window, bg=PANEL_3, height=40)
+            toolbar = tk.Frame(self.viewer_window, bg=PANEL_3, height=44)
             toolbar.pack(fill=tk.X)
             toolbar.pack_propagate(False)
-            tk.Label(toolbar, text=f"  📡  {sender} ekranı paylaşıyor",
-                     bg=PANEL_3, fg=TEXT, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=12)
+            tk.Label(toolbar, text=f"  📡  {sender} ekranını paylaşıyor",
+                     bg=PANEL_3, fg=TEXT, font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=12, pady=12)
+            tk.Label(toolbar, text="🔴 CANLI", bg=PANEL_3, fg=DANGER,
+                     font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+            tk.Button(toolbar, text="✕ Kapat", bg=PANEL_3, fg=MUTED,
+                      bd=0, font=("Segoe UI", 9), padx=10, pady=6, cursor="hand2",
+                      command=lambda: self.viewer_window.destroy()).pack(side=tk.RIGHT, padx=8, pady=6)
 
             self.viewer_label = tk.Label(self.viewer_window, bg=BG)
             self.viewer_label.pack(fill=tk.BOTH, expand=True)
@@ -2485,7 +3643,7 @@ class OPSIPro:
             self.viewer_window.protocol("WM_DELETE_WINDOW", on_close)
 
         win_w = self.viewer_window.winfo_width()
-        win_h = self.viewer_window.winfo_height() - 40
+        win_h = self.viewer_window.winfo_height() - 44
         if win_w > 10 and win_h > 10:
             try:
                 rf = Image.Resampling.LANCZOS
@@ -2499,7 +3657,7 @@ class OPSIPro:
         self.screen_preview_photo = photo
         self.viewer_label.configure(image=photo)
         self.viewer_label.image = photo
-        self.screen_status_var.set(f"📡  {sender} ekran paylaşıyor")
+        self.screen_status_var.set(f"📡  {sender} ekranı paylaşıyor")
         self.current_screen_sender = sender
         self.current_screen_ts     = time.time()
 
@@ -2520,7 +3678,8 @@ class OPSIPro:
             self.sock.bind(("", PORT))
             self.sock.settimeout(SOCK_TIMEOUT)
         except OSError as exc:
-            messagebox.showerror("Ağ Hatası", f"UDP soketi başlatılamadı: {exc}")
+            messagebox.showerror("Ağ Hatası",
+                f"UDP soketi başlatılamadı:\n{exc}\n\nPort {PORT} kullanımda olabilir.")
             raise SystemExit(1)
         threading.Thread(target=self._receiver_loop,  daemon=True).start()
         threading.Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -2547,6 +3706,7 @@ class OPSIPro:
             self.sock.sendto(raw, (BROADCAST_ADDR, PORT))
             return True
         except Exception:
+            self._stats["errors"] += 1
             return False
 
     def _receiver_loop(self):
@@ -2556,7 +3716,9 @@ class OPSIPro:
                 try:
                     pkt = _decode_packet(data)
                 except Exception:
+                    self._stats["errors"] += 1
                     continue
+                self._stats["recv"] += 1
                 self.root.after(0, self._process_packet, pkt)
             except (socket.timeout,):
                 continue
@@ -2635,7 +3797,7 @@ class OPSIPro:
             return
         if sender and sender == self.username_var.get().strip() and \
                 kind in {"MSG", "IMG", "JOIN", "PART", "PING", "AUDIO", "SCREEN", "AVATAR",
-                         "FILE_CHUNK", "EDIT", "DELETE", "TYPING"}:
+                         "FILE_CHUNK", "EDIT", "DELETE", "TYPING", "REACT"}:
             return
         if target and target != self.username_var.get().strip():
             return
@@ -2698,7 +3860,8 @@ class OPSIPro:
         if room != self.current_room:
             return
         if sender in self.banned_users.get(room, set()) and \
-                kind in {"MSG", "IMG", "AUDIO", "HISTORY", "SCREEN", "FILE_CHUNK", "EDIT", "DELETE"}:
+                kind in {"MSG", "IMG", "AUDIO", "HISTORY", "SCREEN", "FILE_CHUNK", "EDIT",
+                         "DELETE", "REACT"}:
             return
 
         # HISTORY_REQ
@@ -2726,8 +3889,6 @@ class OPSIPro:
                     item = ChatItem(item_id=item_id, kind="IMG", sender=snd, ts=ts, room=room,
                                     image_b64=str(raw_item.get("image_b64") or ""),
                                     image_name=str(raw_item.get("image_name") or "image.jpg"))
-                    self.room_history[room].append(item)
-                    self._append_image_message(item)
                 elif item_kind == "AUDIO":
                     item = ChatItem(item_id=item_id, kind="AUDIO", sender=snd, ts=ts, room=room,
                                     audio_b64=str(raw_item.get("audio_b64") or ""),
@@ -2735,21 +3896,37 @@ class OPSIPro:
                                     audio_sr=int(raw_item.get("audio_sr") or AUDIO_SR),
                                     audio_codec=str(raw_item.get("audio_codec") or "zlib_pcm16"),
                                     audio_sec=float(raw_item.get("audio_sec") or 0.0))
-                    self.room_history[room].append(item)
-                    self._append_audio_message(item)
                 elif item_kind == "FILE":
                     item = ChatItem(item_id=item_id, kind="FILE", sender=snd, ts=ts, room=room,
                                     file_b64=str(raw_item.get("file_b64") or ""),
                                     file_name=str(raw_item.get("file_name") or "file"),
                                     file_size=int(raw_item.get("file_size") or 0))
-                    self.room_history[room].append(item)
-                    self._append_file_message(item)
                 else:
                     item = ChatItem(item_id=item_id, kind="MSG", sender=snd, ts=ts, room=room,
-                                    text=str(raw_item.get("text") or ""))
-                    self.room_history[room].append(item)
-                    self._append_text_message(item)
-            self.chat_subtitle.config(text=f"Kurucu: {self.room_owner.get(room, 'bilinmiyor')}")
+                                    text=str(raw_item.get("text") or ""),
+                                    reply_to=str(raw_item.get("reply_to") or ""),
+                                    reply_sender=str(raw_item.get("reply_sender") or ""),
+                                    reply_text=str(raw_item.get("reply_text") or ""))
+                self.room_history[room].append(item)
+            self._render_history(room)
+            return
+
+        # REACT
+        if kind == "REACT":
+            ref_id = str(data.get("ref_id") or "")
+            emoji  = str(data.get("emoji") or "")
+            reacter= str(data.get("user") or sender or "")
+            if ref_id and emoji and reacter:
+                for item in self.room_history[room]:
+                    if item.item_id == ref_id:
+                        if emoji not in item.reactions:
+                            item.reactions[emoji] = []
+                        if reacter not in item.reactions[emoji]:
+                            item.reactions[emoji].append(reacter)
+                        else:
+                            item.reactions[emoji].remove(reacter)
+                        break
+                self._render_history(room)
             return
 
         # MSG
@@ -2758,18 +3935,23 @@ class OPSIPro:
             item = ChatItem(item_id=packet_id or str(uuid.uuid4()), kind="MSG",
                             sender=sender or "Anon",
                             ts=float(pkt.get("ts") or time.time()),
-                            room=room, text=text)
+                            room=room, text=text,
+                            reply_to=str(data.get("reply_to") or ""),
+                            reply_sender=str(data.get("reply_sender") or ""),
+                            reply_text=str(data.get("reply_text") or ""))
             self.seen_packet_ids.add(item.item_id)
             self.room_history[room].append(item)
             self._append_text_message(item)
-            # Typing temizle
             self.typing_users[room].pop(sender, None)
             self._update_typing_indicator(room)
-            # Unread
+            me         = self.username_var.get().strip()
+            is_mention = f"@{me}" in text
             if self.root.focus_displayof() is None:
                 self._unread_counts[room] += 1
-            short = text[:28] + ("…" if len(text) > 28 else "")
-            self._show_notification(f"#{room} — {sender}", short)
+                if is_mention:
+                    self._mention_counts[room] += 1
+            short = text[:48] + ("…" if len(text) > 48 else "")
+            self._show_notification(f"#{room} — {sender}", short, is_mention=is_mention)
             return
 
         # IMG
@@ -2826,14 +4008,14 @@ class OPSIPro:
                     item = ChatItem(item_id=file_id, kind="FILE",
                                     sender=buf["sender"] or "Anon",
                                     ts=time.time(), room=room,
-                                    file_b64=full_b64,
-                                    file_name=buf["name"],
+                                    file_b64=full_b64, file_name=buf["name"],
                                     file_size=buf["size"])
                     if file_id not in self.seen_packet_ids:
                         self.seen_packet_ids.add(file_id)
                         self.room_history[room].append(item)
                         self._append_file_message(item)
-                        self._show_notification(f"#{room} — {sender}", f"Dosya paylaştı: {fname} 📎")
+                        self._show_notification(f"#{room} — {sender}",
+                                                f"Dosya paylaştı: {fname} 📎")
                 except Exception:
                     pass
                 finally:
@@ -2847,7 +4029,8 @@ class OPSIPro:
             if ref_id and new_text:
                 for item in self.room_history[room]:
                     if item.item_id == ref_id and item.sender == sender:
-                        item.text = new_text
+                        item.text   = new_text
+                        item.edited = True
                         break
                 self._render_history(room)
             return
@@ -2877,7 +4060,7 @@ class OPSIPro:
                 self.banned_users[room].add(victim)
                 self._purge_user_messages(room, victim)
                 if victim == self.username_var.get().strip():
-                    self._system_message("Bu odadan banlandın.", DANGER)
+                    self._system_message("🔨 Bu odadan banlandınız.", DANGER)
                     self.leave_room()
                 else:
                     self._system_message(f"🔨 {victim} banlandı.", DANGER)
@@ -2913,80 +4096,113 @@ class OPSIPro:
                 "audio_codec":item.audio_codec,"audio_sec":  item.audio_sec,
                 "file_b64":   item.file_b64,   "file_name":  item.file_name,
                 "file_size":  item.file_size,
+                "reply_to":   item.reply_to,   "reply_sender": item.reply_sender,
+                "reply_text": item.reply_text,
             })
         if payload:
             self._send_packet(self._build_packet("HISTORY", payload, target=target))
 
 
-# ===================== GİRİŞ =====================
-KAYIT_DOSYASI = "test_cozuldu.txt"
-sorular = [
-    {
-        "soru":        "1. Türk müsünüz?",
-        "siklar":      {"a": "Evet", "b": "Hayir", "c": "K_rdum", "d": "K_urdum"},
-        "dogru_cevap": "a",
-        "sayi":        "1"
-    },
-]
-dogru_skor    = 0
-turkmu_durumu = True
+# ===================== GİRİŞ EKRANI (GUI) =====================
+class LoginScreen:
+    """[İYİLEŞTİRME 30] Konsol yerine modern GUI giriş ekranı"""
 
-def testi_baslat():
-    global dogru_skor, turkmu_durumu
-    print("*" * 50)
-    print("SİSTEME GİRİŞ YAPMADAN ÖNCE TESTİ ÇÖZMENİZ GEREKMEKTEDİR")
-    print("*" * 50, "\n")
-    dogru_sayisi = 0
-    toplam_soru  = len(sorular)
-    for index, sv in enumerate(sorular, start=1):
-        print(f"\n--- SORU {index} / {toplam_soru} ---")
-        print(sv["soru"])
-        for harf, metin in sv["siklar"].items():
-            print(f"{harf.upper()}) {metin}")
-        while True:
-            cevap = input("Cevabınız (A/B/C/D): ").strip().lower()
-            if cevap in ["a", "b", "c", "d"]:
-                break
-            print("Lütfen geçerli bir şık giriniz!")
-        if cevap == sv["dogru_cevap"]:
-            print("Doğru!")
-            dogru_sayisi += 1
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title(f"OPSI Pro — Giriş")
+        self.root.resizable(False, False)
+        self.root.configure(bg=PANEL_3)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w, h   = 480, 380
+        self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+        # Windows'ta console gizle
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.ShowWindow(
+                    ctypes.windll.kernel32.GetConsoleWindow(), 0)
+            except Exception:
+                pass
+
+        self._passed = False
+        self._build()
+        self.root.mainloop()
+
+    def _build(self):
+        tk.Frame(self.root, bg=ACCENT, height=3).pack(fill=tk.X)
+
+        # Logo
+        logo_f = tk.Frame(self.root, bg=PANEL_3)
+        logo_f.pack(pady=(32, 4))
+        tk.Label(logo_f, text="⚡", bg=PANEL_3, fg=ACCENT,
+                 font=("Segoe UI", 36)).pack(side=tk.LEFT)
+        tk.Label(logo_f, text="OPSI", bg=PANEL_3, fg=TEXT,
+                 font=("Segoe UI", 32, "bold")).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Label(logo_f, text="Pro", bg=PANEL_3, fg=ACCENT,
+                 font=("Segoe UI", 16)).pack(side=tk.LEFT, padx=(4, 0), pady=(12, 0))
+
+        tk.Label(self.root, text="LAN Anlık Mesajlaşma Sistemi",
+                 bg=PANEL_3, fg=MUTED, font=("Segoe UI", 9)).pack()
+
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill=tk.X, padx=40, pady=(20, 16))
+
+        # Soru
+        q_f = tk.Frame(self.root, bg=PANEL_3)
+        q_f.pack(padx=40, fill=tk.X, pady=4)
+        tk.Label(q_f, text="Sisteme giriş için doğrulama sorusu:", bg=PANEL_3, fg=MUTED_2,
+                 font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(q_f, text="Türk müsünüz?", bg=PANEL_3, fg=TEXT,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(4, 8))
+
+        self._answer = tk.StringVar(value="a")
+        opts_f = tk.Frame(self.root, bg=PANEL_3)
+        opts_f.pack(padx=40, fill=tk.X)
+        choices = [("a", "Evet"), ("b", "Hayır"), ("c", "Bilmiyorum"), ("d", "Fark etmez")]
+        for val, label in choices:
+            tk.Radiobutton(opts_f, text=f"{val.upper()}) {label}", variable=self._answer,
+                           value=val, bg=PANEL_3, fg=TEXT, selectcolor=INPUT,
+                           activebackground=PANEL_3, font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+
+        self._msg_var = tk.StringVar()
+        self._msg_lbl = tk.Label(self.root, textvariable=self._msg_var, bg=PANEL_3,
+                                  fg=MUTED, font=("Segoe UI", 9))
+        self._msg_lbl.pack(pady=6)
+
+        tk.Button(self.root, text="Devam Et →", bg=ACCENT_S, fg="white",
+                  bd=0, font=("Segoe UI", 11, "bold"), padx=30, pady=10,
+                  cursor="hand2", activebackground=ACCENT,
+                  command=self._check).pack(pady=(4, 24))
+
+        tk.Label(self.root, text=f"v{APP_VERSION}", bg=PANEL_3, fg=MUTED_2,
+                 font=("Segoe UI", 7)).pack(side=tk.BOTTOM, pady=6)
+
+        self.root.bind("<Return>", lambda e: self._check())
+
+    def _check(self):
+        ans = self._answer.get()
+        if ans == "a":
+            self._msg_var.set("✅ Doğru! Sistem başlatılıyor…")
+            self._msg_lbl.config(fg=SUCCESS)
+            self.root.after(800, self._launch)
         else:
-            if index == 1:
-                print("Bilgilendirme: İlk soruya verilen cevap sistem analizini etkileyecektir.")
-                turkmu_durumu = False
-            else:
-                print(f"Yanlış! Doğru cevap: {sv['dogru_cevap'].upper()}")
-    dogru_skor = dogru_sayisi
-    print("-" * 50)
-    print(f"Test tamamlandı! Skorunuz: {dogru_skor} / {toplam_soru}")
-    print("-" * 50)
-    ana_sistemi_calistir()
+            self._msg_var.set("❌ Yanlış cevap. Lütfen tekrar deneyin.")
+            self._msg_lbl.config(fg=DANGER)
 
-def analiz():
-    if turkmu_durumu:
-        print("Analiz sonucu: Geçti")
-        return True
-    print("Analiz sonucu: Başarısız")
-    return False
-
-def ana_sistemi_calistir():
-    print(f"\nSistem Başlatılıyor... Durum: {turkmu_durumu}, Skor: {dogru_skor}")
-    if analiz():
-        print("Sistem başarıyla açıldı.")
-        if os.name == 'nt':
-            ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    def _launch(self):
+        self._passed = True
+        self.root.destroy()
+        # LanSchool student'ı kapat (varsa)
         try:
             subprocess.run(["taskkill", "/F", "/IM", "student.exe"],
                            capture_output=True, check=False)
         except Exception:
             pass
+        # Ana uygulamayı başlat
         root = tk.Tk()
         app  = OPSIPro(root)
         root.mainloop()
-    else:
-        print("Erişim reddedildi.")
-        input("Tamam.")
 
+
+# ===================== ENTRYPOINT =====================
 if __name__ == "__main__":
-    testi_baslat()
+    LoginScreen()
